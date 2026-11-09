@@ -43,8 +43,23 @@ class hubspotV3SearchStream(hubspotStream):
     def get_starting_time(self, context):
         start_date = self.get_starting_timestamp(context)
         if start_date:
-            return int(start_date.timestamp() * 1000)
+            starting_time = int(start_date.timestamp() * 1000)
+            # Re-read a short window before a saved bookmark: HubSpot's search
+            # index can lag, so a record updated just before the last run's
+            # end may only become searchable after the bookmark passed it.
+            # The overlap re-emits a few records; downstream merges on id.
+            if self.get_starting_replication_key_value(context) is not None:
+                starting_time -= self.lookback_ms
+            return starting_time
         return int(datetime(2000, 1, 1).timestamp() * 1000)
+
+    @property
+    def lookback_ms(self) -> int:
+        """Lookback before the bookmark, from config `lookback_minutes` (default 60)."""
+        minutes = self._tap.config.get("lookback_minutes")
+        if minutes is None:
+            minutes = 60
+        return max(int(minutes), 0) * 60 * 1000
 
     def get_next_page_token(
         self, response: requests.Response, previous_token: Optional[Any]

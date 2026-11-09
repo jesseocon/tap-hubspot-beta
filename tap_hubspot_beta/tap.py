@@ -350,6 +350,16 @@ class Taphubspot(Tap):
         th.Property("ignore_archived_contacts", th.BooleanType, default=False),
         th.Property("daily_quota_percent_cap", th.IntegerType, default=80),
         th.Property(
+            "lookback_minutes",
+            th.IntegerType,
+            default=60,
+            description=(
+                "Minutes to re-read before the saved bookmark on incremental "
+                "search-API streams, so records HubSpot indexes late are not "
+                "missed. 0 turns the lookback off."
+            ),
+        ),
+        th.Property(
             "exclude_unauthorized_sensitive_properties",
             th.BooleanType,
             default=True,
