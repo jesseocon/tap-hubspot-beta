@@ -10,6 +10,7 @@ from hotglue_singer_sdk import Stream, Tap
 from hotglue_singer_sdk import typing as th
 from hotglue_singer_sdk.exceptions import FatalAPIError
 from hotglue_etl_exceptions import InvalidCredentialsError
+from tap_hubspot_beta import privacy
 from tap_hubspot_beta.client_base import TapHubspotDailyAPIQuotaExceededException
 
 from tap_hubspot_beta.auth import OAuth2Authenticator
@@ -333,6 +334,8 @@ class Taphubspot(Tap):
         parse_env_config=False,
         validate_config=True,
     ) -> None:
+        # Mask emails in every log line this process writes (tap_hubspot_beta.privacy).
+        privacy.install()
         self.config_file = config[0]
         super().__init__(config, catalog, state, parse_env_config, validate_config)
 
@@ -363,6 +366,25 @@ class Taphubspot(Tap):
             "exclude_unauthorized_sensitive_properties",
             th.BooleanType,
             default=True,
+        ),
+        th.Property(
+            "rate_limit_file",
+            th.StringType,
+            description=(
+                "A file that tap processes syncing the same account share to pace their "
+                "requests together (tap_hubspot_beta.rate_limit). Unset: this process paces alone."
+            ),
+        ),
+        th.Property("rate_limit_per_10s", th.IntegerType, description="General requests per 10 seconds (default 95)."),
+        th.Property("search_rate_limit_per_second", th.NumberType, description="CRM search requests per second (default 4)."),
+        th.Property(
+            "use_list_api_for_full_sync",
+            th.BooleanType,
+            default=True,
+            description=(
+                "CRM object streams with no bookmark read through the list (and batch read) API "
+                "instead of search: no 10,000-result windows and the general rate limit. Same records."
+            ),
         ),
     ).to_dict()
 

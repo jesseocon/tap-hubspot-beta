@@ -20,11 +20,12 @@ from tap_hubspot_beta.utils import (
     deep_merge_dicts,
     resolve_oauth_scopes,
 )
-import time
 
 from pendulum import parse
 
 from tap_hubspot_beta.auth import OAuth2Authenticator
+from tap_hubspot_beta import rate_limit
+from tap_hubspot_beta.privacy import describe_context, redact_text
 import singer
 from singer import StateMessage
 from datetime import datetime
@@ -71,6 +72,7 @@ class hubspotStream(RESTStream):
 
     def get_associations(self, from_current_object: str, to_current_object: str) -> list:
         # request associations for the from_current_object and to_current_object
+        self.rate_limiter.acquire("general")
         associations = requests.get(
             f"{self.url_base}crm/v4/associations/{from_current_object}/{to_current_object}/labels",
             headers = self.authenticator.auth_headers or {},
@@ -185,6 +187,39 @@ class hubspotStream(RESTStream):
                                                            self.config["daily_quota_percent_cap"])
                 raise TapHubspotDailyAPIQuotaExceededException(total_message)
 
+    # A 429 is retried here, after the pause HubSpot asks for, this many times before it
+    # counts as a failed request (which the backoff decorator then retries).
+    MAX_RATE_LIMIT_RETRIES = 8
+
+    @property
+    def rate_limiter(self) -> rate_limit.RateLimiter:
+        return rate_limit.limiter_for(self.config)
+
+    def _send_paced(self, prepared_request: requests.PreparedRequest) -> requests.Response:
+        """Send once the account's pacer allows it; wait out and resend a 429."""
+        limiter = self.rate_limiter
+        kind = rate_limit.request_kind(prepared_request.path_url or "")
+        response = None
+        for _ in range(self.MAX_RATE_LIMIT_RETRIES + 1):
+            limiter.acquire(kind)
+            response = self.requests_session.send(prepared_request, timeout=self.timeout)
+            if response.status_code != 429:
+                limiter.observe(response.headers)
+                return response
+            policy = None
+            try:
+                policy = (response.json() or {}).get("policyName")
+            except ValueError:
+                pass
+            if policy == "DAILY":
+                return response
+            seconds = limiter.wait_for_429(kind, response.headers, policy)
+            self.logger.warning(
+                "Rate limited by HubSpot (%s, policy %s) on %s; all requests wait %.1fs",
+                kind, policy or "unknown", self.name, seconds,
+            )
+        return response
+
     def _request(
         self, prepared_request: requests.PreparedRequest, context: Optional[dict]
     ) -> requests.Response:
@@ -193,7 +228,7 @@ class hubspotStream(RESTStream):
         if authenticator:
             prepared_request.headers.update(authenticator.auth_headers or {})
 
-        response = self.requests_session.send(prepared_request, timeout=self.timeout)
+        response = self._send_paced(prepared_request)
         self._check_daily_usage_quota(response)
         if self._LOG_REQUEST_METRICS:
             extra_tags = {}
@@ -420,10 +455,13 @@ class hubspotStream(RESTStream):
         return excluded
     
     def curlify_request(self, request):
+        # The body is left out: a batch read's inputs and a search's filters can hold
+        # record values. The URL is kept with any email masked.
         command = "curl -X {method} -H {headers} -d '{data}' '{uri}'"
         method = request.method
-        uri = request.url
-        data = request.body
+        uri = redact_text(request.url or "")
+        body = request.body or b""
+        data = f"<{len(body)} bytes>" if body else ""
 
         headers = []
         for k, v in request.headers.items():
@@ -437,14 +475,14 @@ class hubspotStream(RESTStream):
 
     def _log_and_raise(self, exception_class, response, message):
         curl_command = self.curlify_request(response.request)
-        logging.info(f"Response code: {response.status_code}, info: {response.text}")
+        logging.info(f"Response code: {response.status_code}, info: {redact_text(response.text[:2000])}")
         logging.info(f"CURL command for failed request: {curl_command}")
         
         try:
             error_message = response.json().get("message")
         except Exception:
-            error_message = response.text
-        raise exception_class(f'Msg {message}, response "{error_message}"')
+            error_message = response.text[:2000]
+        raise exception_class(f'Msg {message}, response "{redact_text(str(error_message))}"')
 
     def validate_response(self, response: requests.Response) -> None:
         #Rate limit logic
@@ -467,10 +505,11 @@ class hubspotStream(RESTStream):
         #     time.sleep(sleep_time)
         
         # if 429 is triggered log the response code and retry    
+        # _send_paced already waited out and resent this 429 several times (a DAILY one is
+        # not retried there). The backoff decorator retries it again, later.
         if response.status_code == 429:
-            self.logger.warn(f"Rate limit reached. Response code: {response.status_code}, info: {response.text}, headers: {response.headers}")
-            time.sleep(30)
-            raise RetriableAPIError(f"Response code: {response.status_code}, info: {response.text}")    
+            self.logger.warning(f"Rate limit reached. Response code: {response.status_code}, info: {redact_text(response.text[:500])}")
+            raise RetriableAPIError(f"Response code: {response.status_code}, info: {redact_text(response.text[:500])}")
             
         """Validate HTTP response."""
         json_parse_failed = False
@@ -486,7 +525,7 @@ class hubspotStream(RESTStream):
         
         elif self.name == "list_membership_v3" and response.status_code == 403 and "You do not have permissions to view object" in response.text:
             curl_command = self.curlify_request(response.request)
-            logging.info(f"Response code: {response.status_code}, info: {response.text}")
+            logging.info(f"Response code: {response.status_code}, info: {redact_text(response.text[:2000])}")
             logging.info(f"CURL command for failed request: {curl_command}")
             # Skip list memberships for this list and continue the sync
             return
@@ -531,7 +570,9 @@ class hubspotStream(RESTStream):
         return th.StringType
 
     def request_schema(self, url, headers):
+        self.rate_limiter.acquire("general")
         response = requests.get(url, headers=headers, timeout=self.timeout)
+        self.rate_limiter.observe(response.headers)
         self._check_daily_usage_quota(response)
         try:
             self.validate_response(response)
@@ -778,11 +819,37 @@ class hubspotStream(RESTStream):
         singer.write_message(StateMessage(value=tap_state))
 
     def backoff_handler(self, details):
-        """Log backoff retry details."""
+        """Log backoff retry details: never the call's arguments (a context holds record values)."""
+        target = getattr(details.get("target"), "__name__", "request")
         self.logger.warning(
-            f"Backing off {details['wait']} seconds after {details['tries']} tries "
-            f"calling function {details['target']} with args {details['args']} "
-            f"and kwargs {details['kwargs']}"
+            f"Backing off {details['wait']:.1f} seconds after {details['tries']} tries "
+            f"calling {target} for stream {self.name}"
+        )
+
+    # --- log lines carry ids and counts, never a context's values (tap_hubspot_beta.privacy) ---
+
+    def sync(self, context: Optional[dict] = None) -> None:
+        """The SDK's Stream.sync, with the context described, not printed."""
+        msg = f"Beginning {self.replication_method.lower()} sync of '{self.name}'"
+        if context:
+            msg += f" with context: {describe_context(context)}"
+        self.logger.info(f"{msg}...")
+        signpost = self.get_replication_key_signpost(context)
+        if signpost:
+            self._write_replication_key_signpost(context, signpost)
+        if self.selected:
+            self._write_schema_message()
+        self._sync_records(context)
+
+    def _write_record_count_log(self, record_count: int, context: Optional[dict]) -> None:
+        super()._write_record_count_log(record_count=record_count, context=describe_context(context))
+
+    def _write_request_duration_log(self, endpoint, response, context, extra_tags) -> None:
+        extra_tags = dict(extra_tags or {})
+        if "url" in extra_tags:
+            extra_tags["url"] = redact_text(str(extra_tags["url"]))
+        super()._write_request_duration_log(
+            endpoint=endpoint, response=response, context=describe_context(context), extra_tags=extra_tags
         )
     
     def parse_properties(self, row, skip_id=None):
@@ -811,7 +878,7 @@ class hubspotStream(RESTStream):
                             row[field] = dt_field.replace(tzinfo=None)
                         except Exception:
                             self.logger.warning(
-                                f"Failed parsing datetime field={field} value={row.get(field)!r} "
+                                f"Failed parsing datetime field={field} (a {type(row.get(field)).__name__} value) "
                                 f"record_id={row.get('id') or row.get('vid')} stream={self.name}; "
                                 f"setting to null; To avoid this issue consider updating the HubSpot property. "
                                 f"This property metadata marks this field as date/datetime but the stored "
@@ -853,6 +920,7 @@ class hubspotStream(RESTStream):
         for list_id in list_ids:
             params = {"limit": 250}
             while True:
+                self.rate_limiter.acquire("general")
                 response = requests.get(
                     f"{self.url_base}crm/v3/lists/{list_id}/memberships",
                         headers=self.authenticator.auth_headers or {},

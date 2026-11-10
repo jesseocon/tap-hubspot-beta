@@ -17,6 +17,7 @@ from backports.cached_property import cached_property
 from hotglue_singer_sdk import typing as th
 from pendulum import parse
 
+from tap_hubspot_beta.privacy import describe_context
 from tap_hubspot_beta.client_base import hubspotStreamSchema
 from tap_hubspot_beta.client_v1 import hubspotV1Stream, hubspotV1SplitUrlStream, hubspotV1PagingStream
 from tap_hubspot_beta.client_v4 import hubspotV4Stream, association_schema
@@ -380,7 +381,7 @@ class ContactSubscriptionStatusStream(hubspotV3Stream):
     def sync_custom(self, context: Optional[dict] = None) -> None:
         msg = f"Beginning {self.replication_method.lower()} sync of '{self.name}'"
         if context:
-            msg += f" with context: {context}"
+            msg += f" with context: {describe_context(context)}"
         self.logger.info(f"{msg}...")
         # Use a replication signpost, if available
         signpost = self.get_replication_key_signpost(context)
@@ -882,6 +883,7 @@ class DealsPipelinesStream(hubspotV3Stream):
 
     def _fetch_pipeline_audit(self, url, headers):
         """Fetch pipeline audit history with centralized retry logic."""
+        self.rate_limiter.acquire("general")
         response = requests.get(url, headers=headers, timeout=self.timeout)
         self._check_daily_usage_quota(response)
         self.validate_response(response)
@@ -1107,10 +1109,14 @@ class ContactsV3Stream(ObjectSearchV3):
                 self.forced_replication_method = catalog_entry.replication_method
 
     def get_child_context(self, record: dict, context) -> dict:
-        return {
-            "id": record["id"],
-            "subscriber_email": record["email"]
-        }
+        # History and associations read by id alone. The email is passed on only for the
+        # subscription status stream, which reads by email when it hangs off this stream
+        # (use_incremental_contact_subscriptions). Logs never print it
+        # (tap_hubspot_beta.privacy.describe_context).
+        context = {"id": record["id"]}
+        if self.config.get("use_incremental_contact_subscriptions", False):
+            context["subscriber_email"] = record.get("email")
+        return context
 
 
 

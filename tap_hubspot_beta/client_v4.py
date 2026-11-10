@@ -20,6 +20,8 @@ class hubspotV4Stream(hubspotStream):
     rest_method = "POST"
     records_jsonpath = "$.results[*]"
     bulk_child = True
+    # HubSpot's v4 association batch read takes 1,000 ids per call.
+    max_inputs_per_request = 1000
 
     def get_url(self, context: Optional[dict]) -> str:
         """Get stream entity URL. """
@@ -29,7 +31,8 @@ class hubspotV4Stream(hubspotStream):
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Optional[dict]:
         """Prepare the data payload for the REST API request."""
-        payload = {"inputs": context["ids"]}
+        # Ids only: a parent's context may carry more (never sent, never logged).
+        payload = {"inputs": [{"id": str(c["id"])} for c in context["ids"]]}
         return payload
 
     def parse_response(self, response: requests.Response):
