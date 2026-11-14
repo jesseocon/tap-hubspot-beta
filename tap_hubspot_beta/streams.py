@@ -18,7 +18,7 @@ from hotglue_singer_sdk import typing as th
 from pendulum import parse
 
 from tap_hubspot_beta.privacy import describe_context
-from tap_hubspot_beta.client_base import hubspotStreamSchema
+from tap_hubspot_beta.client_base import ChildPipeline, hubspotStream, hubspotStreamSchema
 from tap_hubspot_beta.client_v1 import hubspotV1Stream, hubspotV1SplitUrlStream, hubspotV1PagingStream
 from tap_hubspot_beta.client_v4 import hubspotV4Stream, association_schema
 from tap_hubspot_beta.client_v2 import hubspotV2Stream
@@ -1146,6 +1146,7 @@ class ContactsHistoryPropertiesStream(hubspotHistoryV3Stream):
 class ArchivedStream(hubspotV3Stream):
 
     visible_in_catalog = False
+    prefetch_pages = True
 
     def post_process(self, row, context):
         canonical_id = row.pop("id", None)
@@ -1423,6 +1424,7 @@ class DealsHistoryPropertiesStream(hubspotHistoryV3Stream):
 
 class DealsAssociationParent(hubspotV1Stream):
     name = "deals_association_parent"
+    prefetch_pages = True
     path = "deals/v1/deal/paged"
     replication_key = None
     primary_keys = ["id"]
@@ -1440,6 +1442,10 @@ class DealsAssociationParent(hubspotV1Stream):
     def get_child_context(self, record: dict, context) -> dict:
         return {"id": record["id"]}
 
+    def request_records(self, context: Optional[dict]) -> Iterable[dict]:
+        # hubspotV1Stream's paging, through the base class: pages read ahead (prefetch_pages).
+        return hubspotStream.request_records(self, context)
+
     def _sync_records(  # noqa C901  # too complex
         self, context: Optional[dict] = None
     ) -> None:
@@ -1449,6 +1455,8 @@ class DealsAssociationParent(hubspotV1Stream):
         context_list: Optional[List[dict]]
         context_list = [context] if context is not None else self.partitions
         selected = self.selected
+        # Child batches are read on the worker pool and written in order (ChildPipeline).
+        children = ChildPipeline(self, fallback=lambda child, ids: child.sync(context={"ids": list(ids)}))
 
         for current_context in context_list or [{}]:
             partition_record_count = 0
@@ -1478,11 +1486,12 @@ class DealsAssociationParent(hubspotV1Stream):
                 if self.stream_maps[0].get_filter_result(record):
                     child_context_bulk["ids"].append(child_context)
                 if len(child_context_bulk["ids"])>=self.bulk_child_size:
-                    self._sync_children(child_context_bulk)
+                    self._submit_children(children, child_context_bulk)
                     child_context_bulk = {"ids": []}
                 self._check_max_record_limit(record_count)
                 if selected:
                     if (record_count - 1) % self.STATE_MSG_FREQUENCY == 0:
+                        children.drain()
                         self._write_state_message()
                     self._write_record_message(record)
                     try:
@@ -1502,7 +1511,8 @@ class DealsAssociationParent(hubspotV1Stream):
                 record_count += 1
                 partition_record_count += 1
             if len(child_context_bulk):
-                self._sync_children(child_context_bulk)
+                self._submit_children(children, child_context_bulk)
+            children.drain()
             if current_context == state_partition_context:
                 # Finalize per-partition state only if 1:1 with context
                 finalize_state_progress_markers(state)

@@ -2,13 +2,16 @@
 
 from typing import Any, Dict, Iterable, Optional, List
 import copy
+import json
+import math
 
 import requests
 from hotglue_singer_sdk.helpers.jsonpath import extract_jsonpath
 
-from tap_hubspot_beta.client_base import hubspotStream
+from tap_hubspot_beta import concurrency
+from tap_hubspot_beta.client_base import ChildPipeline, hubspotStream
 from pendulum import parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from hotglue_singer_sdk import typing as th
 import singer
 
@@ -313,21 +316,34 @@ class hubspotV3SearchStream(hubspotStream):
         return []
 
 
-    # --- full syncs through the list API -------------------------------------------------
+    # --- search or list, per stream and run ----------------------------------------------
     #
-    # A stream with no bookmark reads every record changed since start_date. The search API
-    # does that in windows of at most 10,000 results (the time buckets above, each costing
-    # count requests), at HubSpot's search limit of about 5 requests a second. The list API
-    # (GET crm/v3/objects/{type}) pages through every record by id at the general limit, with
-    # no window. Its records are the search API's: the same object shape, the same properties
-    # (every selected one is asked for), the same (start_date, sync start] window on the
-    # replication property, applied here instead of by HubSpot. When the property names don't
-    # fit in a URL, each page of ids is read in full with the batch read API.
+    # The search API reads records changed in a window, 200 a page, at HubSpot's search limit
+    # (5 requests a second per account), in windows of at most 10,000 results (the time buckets
+    # above, each costing count requests). The list API (GET crm/v3/objects/{type}) pages
+    # through every record by id at the general limit, with no window. Its records are the
+    # search API's: the same object shape, the same properties (every selected one is asked for),
+    # the same window on the replication property, applied here instead of by HubSpot. When the
+    # property names don't fit in a URL, the list call reads only ids and the window's property,
+    # and the records in the window are read in full with the batch read API, several batches
+    # at once (tap_hubspot_beta.concurrency).
+    #
+    # Which one, decided once per stream and run (config sync_strategy, default auto):
+    # - no bookmark (a first sync, or the runner's full refresh, which starts with no state): list;
+    # - auto with a bookmark: search counts the records changed since (bookmark - lookback) and
+    #   all records (two search calls, one result each); the faster one by the estimate below
+    #   is used. Under auto_list_min_changed changed records, search without estimating more.
+    # - search / list: that one (list still applies the window, so the records are the same).
+    # The decision and its numbers are logged and kept in the run's SYNC_SUMMARY.
 
     # Top-level keys of a search result; anything else the list API adds is dropped.
     SEARCH_RESULT_KEYS = ("id", "properties", "createdAt", "updatedAt", "archived", "archivedAt")
     LIST_PAGE_SIZE = 100  # the list and batch read APIs' maximum
     MAX_LIST_URL_LENGTH = 7000
+    AUTO_LIST_MIN_CHANGED = 5000
+    # Seconds per call, for the estimate before any call of the kind was timed in this run
+    # (Design Center, 2026-11-14: list ids 0.13s, batch read of 1,850 properties 0.75s).
+    DEFAULT_SECONDS = {"search": 0.6, "list": 0.15, "list_full": 0.4, "batch_read": 0.75}
 
     @property
     def hubspot_property_names(self) -> List[str]:
@@ -347,19 +363,113 @@ class hubspotV3SearchStream(hubspotStream):
         value = state.get("replication_key_value") or state.get("progress_markers", {}).get("replication_key_value")
         return bool(value)
 
-    def use_list_api(self, context: Optional[dict]) -> bool:
-        """True for a full sync of a CRM object stream that search reads without extra filters."""
-        if not self.config.get("use_list_api_for_full_sync", True):
-            return False
+    @property
+    def sync_strategy(self) -> str:
+        """auto, search or list (config sync_strategy; use_list_api_for_full_sync=false: search)."""
+        value = str(self.config.get("sync_strategy") or "").strip().lower()
+        if value in ("auto", "search", "list"):
+            return value
+        if self.config.get("use_list_api_for_full_sync", True) is False:
+            return "search"
+        return "auto"
+
+    def list_api_supported(self, context: Optional[dict]) -> bool:
+        """A CRM object stream that search reads without extra filters."""
         if not self.properties_url or not (self.path or "").startswith("crm/v3/objects/"):
             return False
         if not self.path.endswith("/search") or self.filter or self.special_replication:
             return False
         if self.use_list_filtering or (context and context.get("object_id_filters") is not None):
             return False
-        if not self.replication_key or not getattr(self, "replication_key_filter", None):
-            return False
-        return not self._has_bookmark(context)
+        return bool(self.replication_key and getattr(self, "replication_key_filter", None))
+
+    def use_list_api(self, context: Optional[dict]) -> bool:
+        """This run reads the stream through the list API (decided once per context)."""
+        decisions = self.__dict__.setdefault("_strategy_decisions", {})
+        key = json.dumps(context or {}, sort_keys=True, default=str)
+        if key not in decisions:
+            decisions[key] = self.decide_strategy(context)
+        return decisions[key]["strategy"] == "list"
+
+    def decide_strategy(self, context: Optional[dict]) -> dict:
+        if not self.list_api_supported(context):
+            return {"strategy": "search", "reason": "the only way this stream is read"}
+        configured = self.sync_strategy
+        if configured == "search":
+            return self._decided({"strategy": "search", "reason": "sync_strategy search"})
+        if not self._has_bookmark(context):
+            return self._decided({"strategy": "list", "reason": "no bookmark (a first sync or a full refresh)"})
+        if configured == "list":
+            return self._decided({"strategy": "list", "reason": "sync_strategy list"})
+        start, end = self._window_ms(context)
+        changed = self.get_time_bucket_size(context, start, end)
+        decision = {"changed": changed, "since": _iso_ms(start)}
+        minimum = int(self.config.get("auto_list_min_changed", self.AUTO_LIST_MIN_CHANGED))
+        if changed < minimum:
+            return self._decided({**decision, "strategy": "search", "reason": f"under {minimum:,} changed"})
+        total = self.get_time_bucket_size(context, None, None)
+        estimate = self.estimate_seconds(changed, total)
+        strategy = "list" if estimate["list"] < estimate["search"] else "search"
+        return self._decided({**decision, "total": total, "strategy": strategy, "estimate_seconds": estimate,
+                              "reason": "faster by the estimate"})
+
+    def _decided(self, decision: dict) -> dict:
+        from tap_hubspot_beta import stats as sync_stats
+
+        if "changed" in decision and "total" in decision:
+            est = decision["estimate_seconds"]
+            other = "search" if decision["strategy"] == "list" else "list"
+            line = (
+                f"{self.name}: {decision['changed']:,} changed since {decision['since']} of {decision['total']:,}"
+                f" -> {decision['strategy']} (est. {sync_stats.duration(est[decision['strategy']])} vs"
+                f" {sync_stats.duration(est[other])} by {other})"
+            )
+        elif "changed" in decision:
+            line = f"{self.name}: {decision['changed']:,} changed since {decision['since']} -> {decision['strategy']} ({decision['reason']})"
+        else:
+            line = f"{self.name}: {decision['strategy']} ({decision['reason']})"
+        self.logger.info(line)
+        sync_stats.get().decision(self.name, decision)
+        return decision
+
+    def _seconds_per_call(self, kind: str) -> float:
+        """The average time of this kind of call so far in the run, else the default."""
+        from tap_hubspot_beta import stats as sync_stats
+
+        suffix = {"search": f"{self.object_path}/search", "batch_read": f"{self.object_path}/batch/read"}.get(kind)
+        if suffix:
+            measured = sync_stats.get().average_seconds(suffix)
+            if measured:
+                return measured
+        return self.DEFAULT_SECONDS[kind]
+
+    def estimate_seconds(self, changed: int, total: int) -> dict:
+        """Rough seconds to read `changed` of `total` records by search and by list.
+
+        Pages of one stream are sequential (each waits for the last one's cursor); batch reads
+        run side by side; both are capped by the account's request budget."""
+        limits = self.rate_limiter.limits({})
+        general_per_s = limits["general"][0] / limits["general"][1]
+        search_per_s = limits["search"][0] / limits["search"][1]
+
+        pages = math.ceil(changed / self.page_size)
+        buckets = math.ceil(changed / self.max_bucket_size) if changed > self.max_bucket_size else 0
+        # Splitting a window costs two count requests a level, about two levels a bucket.
+        search_calls = pages + 4 * buckets
+        search = max(search_calls / search_per_s, pages * self._seconds_per_call("search"))
+
+        list_pages = math.ceil(total / self.LIST_PAGE_SIZE)
+        if self._list_needs_batch_read():
+            batch_reads = math.ceil(changed / self.LIST_PAGE_SIZE)
+            parallel = max(1, concurrency.max_parallel(self.config))
+            listed = max(
+                (list_pages + batch_reads) / general_per_s,
+                list_pages * self._seconds_per_call("list"),
+                batch_reads * self._seconds_per_call("batch_read") / parallel,
+            )
+        else:
+            listed = max(list_pages / general_per_s, list_pages * self._seconds_per_call("list_full"))
+        return {"search": round(search, 1), "list": round(listed, 1)}
 
     @property
     def object_path(self) -> str:
@@ -373,6 +483,10 @@ class hubspotV3SearchStream(hubspotStream):
         if self.replication_key_filter not in props:
             props.append(self.replication_key_filter)
         return props
+
+    def _list_needs_batch_read(self) -> bool:
+        params = {"limit": self.LIST_PAGE_SIZE, "archived": "false", "properties": ",".join(self._list_properties())}
+        return len(self._list_request(params).url) > self.MAX_LIST_URL_LENGTH
 
     def _window_ms(self, context: Optional[dict]):
         start = self.starting_time or self.get_starting_time(context)
@@ -418,33 +532,44 @@ class hubspotV3SearchStream(hubspotStream):
         decorated_request = self.request_decorator(self._request)
         requested = self._list_properties()
         start, end = self._window_ms(context)
-        full_params = {"limit": self.LIST_PAGE_SIZE, "archived": "false", "properties": ",".join(requested)}
-        batch_read = len(self._list_request(full_params).url) > self.MAX_LIST_URL_LENGTH
+        batch_read = self._list_needs_batch_read()
+        params = {"limit": self.LIST_PAGE_SIZE, "archived": "false", "properties": ",".join(requested)}
         # With batch read, the list call only pages ids (and the window's property).
-        params = dict(full_params)
         if batch_read:
             params["properties"] = self.replication_key_filter
+        pool = concurrency.pool(self.config)
         self.logger.info(
-            "Full sync of '%s' through the list API%s (%s properties)",
-            self.name, " and batch read" if batch_read else "", len(requested),
+            "Sync of '%s' through the list API%s (%s properties, %s requests at once)",
+            self.name, " and batch read" if batch_read else "", len(requested), concurrency.max_parallel(self.config),
         )
-        after = None
-        while True:
-            page_params = dict(params)
-            if after:
-                page_params["after"] = after
-            response = decorated_request(self._list_request(page_params), context)
-            body = response.json()
-            results = [r for r in body.get("results", []) if self._in_window(r, start, end)]
-            if batch_read and results:
-                results = self._batch_read(decorated_request, [r["id"] for r in results], requested, context)
-            rows = [self._shape_like_search(r, requested) for r in results]
+
+        def pages():
+            """Each list page's records in the window, as a future: batch reads run on the pool."""
+            after = None
+            while True:
+                page_params = dict(params)
+                if after:
+                    page_params["after"] = after
+                body = decorated_request(self._list_request(page_params), context).json()
+                results = [r for r in body.get("results", []) if self._in_window(r, start, end)]
+                if batch_read and results:
+                    ids = [r["id"] for r in results]
+                    if pool is None:
+                        yield concurrency.done(self._batch_read(decorated_request, ids, requested, context))
+                    else:
+                        yield pool.submit(self._batch_read, decorated_request, ids, requested, context)
+                else:
+                    yield concurrency.done(results)
+                next_after = ((body.get("paging") or {}).get("next") or {}).get("after")
+                if not next_after or next_after == after:
+                    return
+                after = next_after
+
+        depth = concurrency.max_parallel(self.config) if batch_read else concurrency.PREFETCH_PAGES
+        for future in concurrency.prefetch(pages, depth=depth, enabled=pool is not None):
+            rows = [self._shape_like_search(r, requested) for r in future.result()]
             for row in self.get_associations_data(rows):
                 yield row
-            next_after = ((body.get("paging") or {}).get("next") or {}).get("after")
-            if not next_after or next_after == after:
-                break
-            after = next_after
 
     def _batch_read(self, decorated_request, ids: List[str], requested: List[str], context) -> List[dict]:
         """Every requested property for these ids, in their order (ids gone since are skipped)."""
@@ -459,6 +584,10 @@ class hubspotV3SearchStream(hubspotStream):
         by_id = {str(r.get("id")): r for r in response.json().get("results", [])}
         return [by_id[str(i)] for i in ids if str(i) in by_id]
 
+    # Search pages are read ahead of the records being written: the buckets and cursor live on
+    # the reading thread only.
+    prefetch_pages = True
+
     def request_records(self, context: Optional[dict]) -> Iterable[dict]:
         if self.use_list_api(context):
             yield from self._request_records_list(context)
@@ -467,11 +596,15 @@ class hubspotV3SearchStream(hubspotStream):
 
     def post_process(self, row: dict, context: Optional[dict]) -> dict:
         """As needed, append or transform raw data to match expected structure."""
-        # Every requested property is a column, set or not: the list, batch read and search
-        # APIs then give identical rows whether or not HubSpot sends unset ones as null.
         if self.properties_url and isinstance(row.get("properties"), dict):
-            for name in self.hubspot_property_names:
-                row["properties"].setdefault(name, None)
+            if self.omit_null_properties:
+                # Unset properties are left out on every path (search sends them as null).
+                row["properties"] = {k: v for k, v in row["properties"].items() if v is not None}
+            else:
+                # Every requested property is a column, set or not: the list, batch read and
+                # search APIs then give identical rows whether or not HubSpot sends unset ones.
+                for name in self.hubspot_property_names:
+                    row["properties"].setdefault(name, None)
         row = super().post_process(row, context, skip_id=True)
         # store archived value in _hg_archived
         row["_hg_archived"] = False
@@ -490,6 +623,8 @@ class hubspotV3SearchStream(hubspotStream):
         context_list: Optional[List[dict]]
         context_list = [context] if context is not None else self.partitions
         selected = self.selected
+        # Child batches are read on the worker pool and written in order (ChildPipeline).
+        children = ChildPipeline(self, fallback=self._sync_child)
 
         for current_context in context_list or [{}]:
             if current_context.get("object_id_filters") == []:
@@ -535,11 +670,13 @@ class hubspotV3SearchStream(hubspotStream):
                     for child_stream, batch in child_batches.items():
                         batch.append(child_context)
                         if len(batch) >= self.child_batch_size(child_stream):
-                            self._sync_child(child_stream, batch)
+                            children.submit(child_stream, batch)
                             child_batches[child_stream] = batch = []
 
                 if selected:
                     if (record_count - 1) % self.STATE_MSG_FREQUENCY == 0:
+                        # No STATE before the child records of the records it covers.
+                        children.drain()
                         self._write_state_message()
                     self._write_record_message(record)
                 if selected:
@@ -562,15 +699,17 @@ class hubspotV3SearchStream(hubspotStream):
                 record_count += 1
                 partition_record_count += 1
                 if self._check_max_record_limit(record_count):
+                    children.drain()
                     return
 
             # The last batch, as before (an empty one too: the child still writes its schema).
             for child_stream, batch in child_batches.items():
-                self._sync_child(child_stream, batch)
+                children.submit(child_stream, batch)
+            children.drain()
             if current_context == state_partition_context:
                 # Finalize per-partition state only if 1:1 with context
                 finalize_state_progress_markers(state)
-        
+
 
         if not context:
             # Finalize total stream only if we have the full full context.
@@ -580,7 +719,7 @@ class hubspotV3SearchStream(hubspotStream):
         # Reset interim bookmarks before emitting final STATE message:
         self._write_state_message()
 
-    
+
     def child_batch_size(self, child_stream) -> int:
         """Parent ids per child request: what the child's API takes (v4 associations 1,000,
         history batch reads 50), else this stream's bulk_child_size."""
@@ -597,6 +736,12 @@ class hubspotV3SearchStream(hubspotStream):
         for child_stream in self.child_streams:
             if child_stream.selected or child_stream.has_selected_descendents:
                 self._sync_child(child_stream, child_context.get("ids") or [])
+
+
+def _iso_ms(value: Optional[int]) -> Optional[str]:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(value / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
 
 
 class hubspotV3Stream(hubspotStream):
@@ -638,6 +783,7 @@ class hubspotV3Stream(hubspotStream):
 class AssociationsV3ParentStream(hubspotV3Stream):
     name = "associations_v3_parent"
     primary_keys = ["id"]
+    prefetch_pages = True
 
     def get_child_context(self, record: dict, context) -> dict:
         return {"id": record["id"]}
@@ -651,6 +797,8 @@ class AssociationsV3ParentStream(hubspotV3Stream):
         context_list: Optional[List[dict]]
         context_list = [context] if context is not None else self.partitions
         selected = self.selected
+        # Child batches are read on the worker pool and written in order (ChildPipeline).
+        children = ChildPipeline(self, fallback=lambda child, ids: child.sync(context={"ids": list(ids)}))
 
         for current_context in context_list or [{}]:
             partition_record_count = 0
@@ -680,11 +828,12 @@ class AssociationsV3ParentStream(hubspotV3Stream):
                 if self.stream_maps[0].get_filter_result(record):
                     child_context_bulk["ids"].append(child_context)
                 if len(child_context_bulk["ids"])>=self.bulk_child_size:
-                    self._sync_children(child_context_bulk)
+                    self._submit_children(children, child_context_bulk)
                     child_context_bulk = {"ids": []}
                 self._check_max_record_limit(record_count)
                 if selected:
                     if (record_count - 1) % self.STATE_MSG_FREQUENCY == 0:
+                        children.drain()
                         self._write_state_message()
                     self._write_record_message(record)
                     try:
@@ -704,7 +853,8 @@ class AssociationsV3ParentStream(hubspotV3Stream):
                 record_count += 1
                 partition_record_count += 1
             if len(child_context_bulk):
-                self._sync_children(child_context_bulk)
+                self._submit_children(children, child_context_bulk)
+            children.drain()
             if current_context == state_partition_context:
                 # Finalize per-partition state only if 1:1 with context
                 finalize_state_progress_markers(state)
@@ -717,6 +867,9 @@ class AssociationsV3ParentStream(hubspotV3Stream):
         self._write_state_message()
 
 class DynamicDiscoveredHubspotV3Stream(hubspotV3Stream):
+    # Custom objects: every record, page after page (the cursor is the only state).
+    prefetch_pages = True
+
     def post_process(self, row: dict, context: Optional[dict]) -> dict:
         """As needed, append or transform raw data to match expected structure."""
         for name, value in row["properties"].items():
@@ -779,6 +932,7 @@ class hubspotV3SingleSearchStream(hubspotStream):
 class hubspotHistoryV3Stream(hubspotV3Stream):
     rest_method = "POST"
     bulk_child = True
+    prefetchable_child = True
     # HubSpot's batch read with propertiesWithHistory takes 50 ids.
     max_inputs_per_request = 50
     schema_written = False
