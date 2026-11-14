@@ -25,6 +25,32 @@ tap is available by running:
 tap-hubspot --about
 ```
 
+### Speed: requests in parallel, search or list, and what each run did
+
+- **One request budget per account.** At most `rate_limit_per_10s` (default 110) requests start
+  in any 10-second window and `search_rate_limit_per_second` (default 5) search requests in any
+  second, across every thread, and across tap processes sharing `rate_limit_file`. A 429 waits
+  Retry-After and is resent. HubSpot's daily limit stops the sync with a message saying so.
+- **Requests in parallel, output in order** (`max_parallel_requests`, default 8; 1 turns it off).
+  Pages are read ahead of the records being written. Batch reads, association batches (1,000 ids)
+  and history batches (50 ids) are read on worker threads while the parent reads on. Records and
+  STATE are written by one thread, in the order the sequential tap wrote them. A STATE never comes
+  before the child records of the records it covers.
+- **Search or list, per stream and run** (`sync_strategy`: `auto` default, `search`, `list`). With
+  no bookmark (a first sync, a full refresh) CRM objects are read through the list API. With one,
+  `auto` counts the records changed since the bookmark (less `lookback_minutes`) and all records,
+  and reads by whichever is estimated faster. Under `auto_list_min_changed` (default 5,000)
+  changed records it searches. Both read the same window and leave the same bookmark (the latest
+  `updatedAt` written).
+- **`omit_null_properties`** (default false): properties without a value are left out of RECORD
+  messages. Use it with a loader that stores a missing property as null: the same rows, much less
+  work. HubSpot leaves most properties of a wide object unset (84% of contacts' 1,859 columns on one
+  portal).
+- **Logs.** Each decision is logged (`contacts: 182,400 changed since 2026-11-13T09:00Z of 190,112 -> list
+  (est. 5m47s vs 9m07s by search)`). At the end of each stream and of the run there is a summary:
+  records, requests per endpoint, average latency, 429s, time waited for the budget, wall and CPU
+  time. The same numbers follow as JSON on a `SYNC_SUMMARY` line.
+
 ### Source Authentication and Authorization
 
 - [ ] `Developer TODO:` If your tap requires special access on the source system, or any special authentication requirements, provide those here.

@@ -24,18 +24,86 @@ from tap_hubspot_beta.utils import (
 from pendulum import parse
 
 from tap_hubspot_beta.auth import OAuth2Authenticator
-from tap_hubspot_beta import rate_limit
+from tap_hubspot_beta import concurrency, rate_limit
+from tap_hubspot_beta import stats as sync_stats
 from tap_hubspot_beta.privacy import describe_context, redact_text
 import singer
-from singer import StateMessage
-from datetime import datetime
+from singer import RecordMessage, StateMessage
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+from collections import deque
+import re
+import time
 import pytz
 import http.client
+from hotglue_singer_sdk.helpers._catalog import pop_deselected_record_properties
+from hotglue_singer_sdk.helpers._typing import conform_record_data_types, to_json_compatible
+from hotglue_singer_sdk.helpers._util import utc_now
 logging.getLogger("backoff").setLevel(logging.CRITICAL)
+
+# HubSpot's own datetime text, e.g. 2024-01-01T00:00:00.123Z: read without pendulum (same value).
+_HUBSPOT_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?Z$")
+
+
+def parse_hubspot_datetime(value):
+    """pendulum.parse(value), faster for HubSpot's usual UTC text (an equal, UTC datetime)."""
+    if isinstance(value, str):
+        match = _HUBSPOT_ISO.match(value)
+        if match:
+            y, mo, d, h, mi, s, frac = match.groups()
+            try:
+                return datetime(int(y), int(mo), int(d), int(h), int(mi), int(s),
+                                int((frac or "0").ljust(6, "0")), tzinfo=timezone.utc)
+            except ValueError:
+                pass
+    return parse(value)
 
 
 class TapHubspotDailyAPIQuotaExceededException(Exception):
     """Raised when HubSpot daily quota usage exceeds configured cap."""
+
+
+class ChildPipeline:
+    """A parent's child batches: read on the worker pool while the parent reads on, written in
+    the order they were made, on the main thread.
+
+    A batch whose child can't be read ahead (not a one-call batch read, or requests run one at a
+    time) is written at once, after the batches before it, as the sequential tap did.
+    drain() writes every batch read so far: the parent calls it before each STATE message, so
+    a STATE never comes before the child records of the parent records it covers.
+    """
+
+    def __init__(self, parent: "hubspotStream", fallback) -> None:
+        self.parent = parent
+        # How the parent synced a batch itself: fallback(child, contexts).
+        self.fallback = fallback
+        self.pool = concurrency.pool(parent.config)
+        self.max_pending = concurrency.max_parallel(parent.config) * 2
+        self.pending: deque = deque()
+
+    def submit(self, child: "hubspotStream", contexts: List[dict]) -> None:
+        if self.pool is None or not contexts or not getattr(child, "prefetchable_child", False) or not child.bulk_child:
+            self.drain()
+            self.fallback(child, contexts)
+            return
+        context = {"ids": list(contexts)}
+        future = self.pool.submit(child.fetch_child_records, context)
+        child.__dict__.setdefault("_prefetched", {})[id(context["ids"])] = future
+        self.pending.append((child, context, future))
+        # Write what is ready, in order; wait when too many are out.
+        while self.pending and (self.pending[0][2].done() or len(self.pending) > self.max_pending):
+            self._write_first()
+
+    def drain(self) -> None:
+        while self.pending:
+            self._write_first()
+
+    def _write_first(self) -> None:
+        child, context, future = self.pending.popleft()
+        try:
+            future.result()  # a failed read raises here, at its place in the order
+            child.sync(context=context)
+        finally:
+            child.__dict__.get("_prefetched", {}).pop(id(context["ids"]), None)
 
 class hubspotStream(RESTStream):
     """hubspot stream class."""
@@ -176,7 +244,7 @@ class hubspotStream(RESTStream):
             daily_remaining = int(daily_remaining)
             daily_used = daily_limit - daily_remaining
             percent_used = (daily_used / daily_limit) * 100
-            if percent_used >= self.config["daily_quota_percent_cap"]:
+            if percent_used >= self.config.get("daily_quota_percent_cap", 80):
                 total_message = ("Hubspot has reported {}/{} ({:3.2f}%) {} API quota usage " +
                              "across all Hubspot Private Distributed Apps. Terminating " +
                              "job to avoid exceeding the configured cap " +
@@ -184,7 +252,7 @@ class hubspotStream(RESTStream):
                                                            daily_limit,
                                                            percent_used,
                                                            self._classify_limit_policy(response),
-                                                           self.config["daily_quota_percent_cap"])
+                                                           self.config.get("daily_quota_percent_cap", 80))
                 raise TapHubspotDailyAPIQuotaExceededException(total_message)
 
     # A 429 is retried here, after the pause HubSpot asks for, this many times before it
@@ -195,14 +263,26 @@ class hubspotStream(RESTStream):
     def rate_limiter(self) -> rate_limit.RateLimiter:
         return rate_limit.limiter_for(self.config)
 
+    @property
+    def requests_session(self) -> requests.Session:
+        """This thread's session: pages, batch reads and child reads run on several threads
+        (tap_hubspot_beta.concurrency)."""
+        return concurrency.session()
+
     def _send_paced(self, prepared_request: requests.PreparedRequest) -> requests.Response:
-        """Send once the account's pacer allows it; wait out and resend a 429."""
+        """Send once the account's budget allows it; wait out and resend a 429. Every attempt is
+        counted under this stream (tap_hubspot_beta.stats)."""
         limiter = self.rate_limiter
-        kind = rate_limit.request_kind(prepared_request.path_url or "")
+        path_url = prepared_request.path_url or ""
+        kind = rate_limit.request_kind(path_url)
+        key = sync_stats.endpoint_key(prepared_request.method or "GET", path_url)
+        counter = sync_stats.get()
         response = None
         for _ in range(self.MAX_RATE_LIMIT_RETRIES + 1):
-            limiter.acquire(kind)
+            waited = limiter.acquire(kind)
+            started = time.monotonic()
             response = self.requests_session.send(prepared_request, timeout=self.timeout)
+            counter.request(self.name, key, time.monotonic() - started, response.status_code, waited)
             if response.status_code != 429:
                 limiter.observe(response.headers)
                 return response
@@ -211,8 +291,7 @@ class hubspotStream(RESTStream):
                 policy = (response.json() or {}).get("policyName")
             except ValueError:
                 pass
-            if policy == "DAILY":
-                return response
+            # A DAILY 429 raises rate_limit.DailyLimitReached: the sync stops, saying why.
             seconds = limiter.wait_for_429(kind, response.headers, policy)
             self.logger.warning(
                 "Rate limited by HubSpot (%s, policy %s) on %s; all requests wait %.1fs",
@@ -235,7 +314,8 @@ class hubspotStream(RESTStream):
             if self._LOG_REQUEST_METRIC_URLS:
                 extra_tags["url"] = prepared_request.path_url
             self._write_request_duration_log(
-                endpoint=self.path,
+                # The endpoint called (a list or batch read of a search stream is not its search).
+                endpoint=(prepared_request.path_url or self.path or "").split("?", 1)[0].lstrip("/"),
                 response=response,
                 context=context,
                 extra_tags=extra_tags,
@@ -365,8 +445,41 @@ class hubspotStream(RESTStream):
                             
         return parsed_response
 
-    def request_records(self, context): # noqa: C901
+    # Read pages on a background thread, ahead of the records being written
+    # (tap_hubspot_beta.concurrency.prefetch). Only for streams whose paging depends on nothing
+    # but the responses.
+    prefetch_pages = False
+    # A child whose batch (ids) is read in one call: its parent fetches it on the worker pool
+    # while it reads on, and writes its records later, in order (ChildPipeline).
+    prefetchable_child = False
+
+    def request_records(self, context):
         """Request records from REST endpoint(s), returning response records."""
+        prefetched = self._take_prefetched(context)
+        if prefetched is not None:
+            yield from prefetched.result()
+            return
+        parallel = concurrency.max_parallel(self.config) > 1
+        for rows in concurrency.prefetch(lambda: self._request_pages(context), enabled=self.prefetch_pages and parallel):
+            yield from rows
+
+    def _submit_children(self, pipeline: ChildPipeline, child_context: dict) -> None:
+        """The SDK's _sync_children for a batch of ids, through the pipeline."""
+        for child in self.child_streams:
+            if child.selected or child.has_selected_descendents:
+                pipeline.submit(child, child_context.get("ids") or [])
+
+    def fetch_child_records(self, context: dict) -> list:
+        """A child batch's records, read now (on a worker thread) and written later."""
+        return [row for rows in self._request_pages(context) for row in rows]
+
+    def _take_prefetched(self, context):
+        if not context or not isinstance(context.get("ids"), list):
+            return None
+        return self.__dict__.setdefault("_prefetched", {}).pop(id(context["ids"]), None)
+
+    def _request_pages(self, context): # noqa: C901
+        """Each page's rows, page after page."""
         next_page_token = None
         finished = False
         decorated_request = self.request_decorator(self._request)
@@ -383,8 +496,7 @@ class hubspotStream(RESTStream):
 
             # fetch associations for objects in add_associations_to_schema
             parsed_response = self.get_associations_data(parsed_response)
-            for row in parsed_response:
-                yield row
+            yield parsed_response
             previous_token = copy.deepcopy(next_page_token)
             next_page_token = self.get_next_page_token(
                 response=resp, previous_token=previous_token
@@ -769,31 +881,6 @@ class hubspotStream(RESTStream):
             ]
         return self._stream_maps
 
-    def process_row_types(self,row) -> Dict[str, Any]:
-        schema = self.schema['properties']
-        # If the row is null we ignore
-        if row is None:
-            return row
-
-        for field, value in row.items():
-            if field not in schema:
-                # Skip fields not found in the schema
-                continue
-
-            field_info = schema[field]
-            field_type = field_info.get("type", ["null"])[0]
-
-            if field_type == "boolean":
-                # this is to make the singer sdk logic here work: https://github.com/meltano/sdk/blob/v0.4.4/singer_sdk/helpers/_typing.py#L218
-                if value == "":
-                    row[field] = None
-                if isinstance(value, str):
-                    if value.lower() == "true":
-                        row[field] = True
-                    elif value.lower() == "false":
-                        row[field] = False
-
-        return row
 
     def is_first_sync(self):  # noqa: F811
         if self.stream_state.get("replication_key"):
@@ -839,7 +926,93 @@ class hubspotStream(RESTStream):
             self._write_replication_key_signpost(context, signpost)
         if self.selected:
             self._write_schema_message()
+        top_level = context is None
+        if top_level:
+            sync_stats.get().start(self.name)
         self._sync_records(context)
+        if top_level:
+            self.log_sync_summary()
+
+    def _descendant_names(self) -> List[str]:
+        names = []
+        for child in self.child_streams:
+            names.append(child.name)
+            names.extend(child._descendant_names() if hasattr(child, "_descendant_names") else [])
+        return names
+
+    def log_sync_summary(self) -> None:
+        """What this stream (and its children) did: tap_hubspot_beta.stats."""
+        summary = sync_stats.get().stream_summary(self.name, self._descendant_names())
+        self.logger.info(sync_stats.describe(self.name, summary))
+        self.logger.info(sync_stats.summary_json(self.name, summary))
+
+    # --- writing records ----------------------------------------------------------------
+    #
+    # The SDK's _generate_record_messages, the same output with less work per value: the
+    # property types are looked up once per stream, not per value. With config
+    # omit_null_properties, properties without a value are left out of the RECORD (a loader that
+    # writes a missing property as null stores the same row; HubSpot leaves most of a wide
+    # object's properties unset).
+
+    @cached_property
+    def _conform_plan(self):
+        properties = self.schema.get("properties", {})
+        booleans = set()
+        for name, prop in properties.items():
+            types = prop.get("anyOf", [prop.get("type")])
+            if any(t and ("boolean" in t or t == "boolean") for t in types):
+                booleans.add(name)
+        mask = self.mask
+        all_selected = all(selected for selected in mask.values())
+        return properties, booleans, all_selected
+
+    @property
+    def omit_null_properties(self) -> bool:
+        return bool(self.config.get("omit_null_properties", False))
+
+    def _conform(self, record: dict) -> dict:
+        properties, booleans, all_selected = self._conform_plan
+        if not all_selected:
+            pop_deselected_record_properties(record, self.schema, self.mask, self.logger)
+        omit_nulls = self.omit_null_properties
+        rec: Dict[str, Any] = {}
+        unmapped: List[str] = []
+        for name, value in record.items():
+            if name not in properties:
+                unmapped.append(name)
+                continue
+            if value is None:
+                if not omit_nulls:
+                    rec[name] = None
+                continue
+            if isinstance(value, datetime):
+                rec[name] = value.isoformat() if value.tzinfo is timezone.utc else to_json_compatible(value)
+            elif isinstance(value, (date, timedelta, dt_time, bytes)):
+                rec[name] = conform_record_data_types(self.name, {name: value}, self.schema, self.logger)[name]
+            elif name in booleans:
+                rec[name] = False if value == 0 else True
+            else:
+                rec[name] = value
+        if unmapped:
+            # The SDK's own warning, once per set of names.
+            conform_record_data_types(self.name, {n: None for n in unmapped}, self.schema, self.logger)
+        return rec
+
+    def _generate_record_messages(self, record: dict):
+        record = self._conform(record)
+        for stream_map in self.stream_maps:
+            mapped_record = stream_map.transform(record)
+            if mapped_record is not None:
+                yield RecordMessage(
+                    stream=stream_map.stream_alias,
+                    record=mapped_record,
+                    version=None,
+                    time_extracted=utc_now(),
+                )
+
+    def _write_record_message(self, record: dict) -> None:
+        super()._write_record_message(record)
+        sync_stats.get().records(self.name, 1)
 
     def _write_record_count_log(self, record_count: int, context: Optional[dict]) -> None:
         super()._write_record_count_log(record_count=record_count, context=describe_context(context))
@@ -864,6 +1037,33 @@ class hubspotStream(RESTStream):
             row.pop("properties", None)
         return row
     
+    @cached_property
+    def _boolean_fields(self) -> List[str]:
+        """What process_row_types converts: fields whose first schema type is boolean."""
+        out = []
+        for name, info in self.schema["properties"].items():
+            types = info.get("type", ["null"])
+            if types and types[0] == "boolean":
+                out.append(name)
+        return out
+
+    def process_row_types(self, row) -> Dict[str, Any]:
+        """Boolean fields: "" is null, "true"/"false" are booleans (only those fields looked at)."""
+        if row is None:
+            return row
+        for field in self._boolean_fields:
+            if field not in row:
+                continue
+            value = row[field]
+            if value == "":
+                row[field] = None
+            if isinstance(value, str):
+                if value.lower() == "true":
+                    row[field] = True
+                elif value.lower() == "false":
+                    row[field] = False
+        return row
+
     def parse_datetimes(self, row):
         for field in self.datetime_fields:
             if row.get(field) is not None:
@@ -871,7 +1071,7 @@ class hubspotStream(RESTStream):
                     row[field] = None
                 else:
                     try:
-                        row[field] = parse(row[field])
+                        row[field] = parse_hubspot_datetime(row[field])
                     except Exception:
                         try:
                             dt_field = datetime.fromtimestamp(int(row[field]) / 1000, tz=pytz.UTC)

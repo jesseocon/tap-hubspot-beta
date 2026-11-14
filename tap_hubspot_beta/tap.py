@@ -11,6 +11,7 @@ from hotglue_singer_sdk import typing as th
 from hotglue_singer_sdk.exceptions import FatalAPIError
 from hotglue_etl_exceptions import InvalidCredentialsError
 from tap_hubspot_beta import privacy
+from tap_hubspot_beta import stats as sync_stats
 from tap_hubspot_beta.client_base import TapHubspotDailyAPIQuotaExceededException
 
 from tap_hubspot_beta.auth import OAuth2Authenticator
@@ -375,18 +376,66 @@ class Taphubspot(Tap):
                 "requests together (tap_hubspot_beta.rate_limit). Unset: this process paces alone."
             ),
         ),
-        th.Property("rate_limit_per_10s", th.IntegerType, description="General requests per 10 seconds (default 95)."),
-        th.Property("search_rate_limit_per_second", th.NumberType, description="CRM search requests per second (default 4)."),
+        th.Property(
+            "rate_limit_per_10s",
+            th.IntegerType,
+            description="Requests per 10 seconds for the account, every thread and process together (default 110).",
+        ),
+        th.Property(
+            "search_rate_limit_per_second",
+            th.NumberType,
+            description="CRM search requests per second for the account (default 5).",
+        ),
+        th.Property(
+            "max_parallel_requests",
+            th.IntegerType,
+            description=(
+                "Requests in flight at once in this process (default 8; 1: one at a time). Batch reads "
+                "and association/history reads run side by side, pages are read ahead; output order "
+                "and state are the same. The rate limits above still apply."
+            ),
+        ),
+        th.Property(
+            "sync_strategy",
+            th.StringType,
+            description=(
+                "How CRM object streams are read. auto (default): with no bookmark (first sync, full "
+                "refresh) the list API; with one, search or list, whichever is estimated faster for "
+                "the records changed since the bookmark. search / list: always that one. Same records."
+            ),
+        ),
+        th.Property(
+            "auto_list_min_changed",
+            th.IntegerType,
+            description="auto: fewer records changed than this (default 5,000) always read by search.",
+        ),
         th.Property(
             "use_list_api_for_full_sync",
             th.BooleanType,
             default=True,
+            description="false: the same as sync_strategy search (kept for older configs).",
+        ),
+        th.Property(
+            "omit_null_properties",
+            th.BooleanType,
+            default=False,
             description=(
-                "CRM object streams with no bookmark read through the list (and batch read) API "
-                "instead of search: no 10,000-result windows and the general rate limit. Same records."
+                "Leave properties without a value out of RECORD messages (default false: sent as "
+                "null). For loaders that store a missing property as null: the same rows, much less "
+                "work for wide objects."
             ),
         ),
     ).to_dict()
+
+    def sync_all(self) -> None:
+        """Sync every stream; then log what the run did (tap_hubspot_beta.stats)."""
+        sync_stats.reset()
+        try:
+            super().sync_all()
+        finally:
+            summary = sync_stats.get().run_summary()
+            self.logger.info(sync_stats.describe("run", summary))
+            self.logger.info(sync_stats.summary_json("run", summary))
 
     def discover_streams(self) -> List[Stream]:
         """Return a list of discovered streams."""

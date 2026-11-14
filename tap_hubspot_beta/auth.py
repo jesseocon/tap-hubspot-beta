@@ -1,6 +1,7 @@
 """hubspot Authentication."""
 
 import json
+import threading
 from datetime import datetime
 
 import requests
@@ -9,6 +10,11 @@ from hotglue_singer_sdk.authenticators import OAuthAuthenticator
 from hotglue_singer_sdk.exceptions import RetriableAPIError
 from hotglue_etl_exceptions import InvalidCredentialsError
 import backoff
+
+# Requests run on several threads (tap_hubspot_beta.concurrency): one of them refreshes an
+# expired token, the others wait for it and use the new one.
+_REFRESH_LOCK = threading.Lock()
+
 
 class OAuth2Authenticator(OAuthAuthenticator):
     """API Authenticator for OAuth 2.0 flows."""
@@ -23,7 +29,9 @@ class OAuth2Authenticator(OAuthAuthenticator):
             HTTP headers for authentication.
         """
         if not self.is_token_valid():
-            self.update_access_token()
+            with _REFRESH_LOCK:
+                if not self.is_token_valid():
+                    self.update_access_token()
         result = super().auth_headers
         result["Authorization"] = f"Bearer {self._tap._config.get('access_token')}"
         return result

@@ -22,6 +22,8 @@ class hubspotV4Stream(hubspotStream):
     bulk_child = True
     # HubSpot's v4 association batch read takes 1,000 ids per call.
     max_inputs_per_request = 1000
+    # Its parent reads a batch on the worker pool while it reads on (ChildPipeline).
+    prefetchable_child = True
 
     def get_url(self, context: Optional[dict]) -> str:
         """Get stream entity URL. """

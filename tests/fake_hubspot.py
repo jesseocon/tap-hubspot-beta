@@ -47,7 +47,8 @@ def ms(value: str) -> int:
 
 
 class FakeHubSpot:
-    def __init__(self, sizes: Dict[str, int], seed: int = 7, links_per_contact: int = 3) -> None:
+    def __init__(self, sizes: Dict[str, int], seed: int = 7, links_per_contact: int = 3,
+                 archived: Optional[Dict[str, int]] = None) -> None:
         rng = random.Random(seed)
         self.records: Dict[str, List[dict]] = {}
         # A fixed order, so the same sizes always give the same records.
@@ -87,8 +88,23 @@ class FakeHubSpot:
             for record in self.records.get(src, []):
                 n = rng.randint(0, links_per_contact) if targets else 0
                 table[record["id"]] = sorted({rng.choice(targets) for _ in range(n)}, key=int)
+        # Archived records (list with archived=true), only when asked for: obj -> rows.
+        self.archived = {obj: self._archived_rows(obj, count, rng) for obj, count in (archived or {}).items()}
         self.calls: List[dict] = []
         self.v4_inputs: List[List[dict]] = []
+        self.history_inputs: List[List[dict]] = []
+
+    @staticmethod
+    def _archived_rows(obj: str, count: int, rng: random.Random) -> List[dict]:
+        rows = []
+        for i in range(count):
+            rid = str(900000 + i)
+            created = BASE + timedelta(hours=rng.randint(0, 20000))
+            gone = created + timedelta(days=rng.randint(1, 600))
+            rows.append({"id": rid, "properties": {"hs_object_id": rid, "createdate": iso(created)},
+                         "known": set(PROPERTIES[obj]), "createdAt": iso(created), "updatedAt": iso(gone),
+                         "archived": True, "archivedAt": iso(gone)})
+        return rows
 
     # --- HTTP -----------------------------------------------------------------------------
 
@@ -123,7 +139,7 @@ class FakeHubSpot:
                 return 200, self.batch_read(obj, body or {})
             if method == "GET" and len(parts) == 4:
                 if query.get("archived") == "true":
-                    return 200, {"results": []}
+                    return 200, self.list(obj, query, archived=True)
                 return 200, self.list(obj, query)
         if path.startswith("crm/v4/associations/") and path.endswith("/batch/read"):
             assert len(body["inputs"]) <= 1000, "v4 batch read takes at most 1,000 ids"
@@ -145,7 +161,7 @@ class FakeHubSpot:
         return {name: props[name] for name in requested if name in props}
 
     def _shape(self, record: dict, requested: List[str], nulls: bool) -> dict:
-        out = {k: record[k] for k in ("id", "createdAt", "updatedAt", "archived")}
+        out = {k: record[k] for k in ("id", "createdAt", "updatedAt", "archived", "archivedAt") if k in record}
         out["properties"] = self._props(record, requested, nulls)
         return out
 
@@ -171,10 +187,10 @@ class FakeHubSpot:
             out["paging"] = {"next": {"after": str(limit)}}
         return out
 
-    def list(self, obj: str, query: dict) -> dict:
+    def list(self, obj: str, query: dict, archived: bool = False) -> dict:
         assert int(query.get("limit", 10)) <= 100, "the list API takes at most 100"
         requested = [p for p in (query.get("properties") or "").split(",") if p]
-        rows = self.records[obj]
+        rows = self.archived.get(obj, []) if archived else self.records[obj]
         after = query.get("after")
         if after:
             rows = [r for r in rows if int(r["id"]) > int(after)]
@@ -186,11 +202,28 @@ class FakeHubSpot:
         return out
 
     def batch_read(self, obj: str, body: dict) -> dict:
+        if "propertiesWithHistory" in body:
+            return self.history_read(obj, body)
         assert len(body["inputs"]) <= 100, "batch read takes at most 100 ids"
         wanted = {i["id"] for i in body["inputs"]}
         rows = [r for r in self.records[obj] if r["id"] in wanted]
         rows.reverse()  # HubSpot gives no order
         return {"status": "COMPLETE", "results": [self._shape(r, body.get("properties") or [], False) for r in rows]}
+
+    def history_read(self, obj: str, body: dict) -> dict:
+        """batch read with propertiesWithHistory: each set property's one version."""
+        assert len(body["inputs"]) <= 50, "batch read with history takes at most 50 ids"
+        self.history_inputs.append(body["inputs"])
+        wanted = {i["id"] for i in body["inputs"]}
+        out = []
+        for r in self.records[obj]:
+            if r["id"] not in wanted:
+                continue
+            history = {name: [{"value": r["properties"][name], "timestamp": r["updatedAt"], "sourceType": "API"}]
+                       for name in body["propertiesWithHistory"] if name in r["properties"]}
+            out.append({**{k: r[k] for k in ("id", "createdAt", "updatedAt", "archived")}, "propertiesWithHistory": history})
+        out.reverse()
+        return {"status": "COMPLETE", "results": out}
 
     def deals_v1(self, query: dict) -> dict:
         offset = int(query.get("offset") or 0)
