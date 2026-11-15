@@ -1191,6 +1191,65 @@ class CompaniesStream(ObjectSearchV3):
     properties_url = "properties/v1/companies/properties"
 
 
+class CustomObjectStream(ObjectSearchV3):
+    """A custom object, read like the CRM objects: since the bookmark (less lookback_minutes) by
+    search or list, whichever is faster (sync_strategy), everything by list on a full sync.
+
+    Its records keep the shape they had when every run read the whole object: id, createdAt,
+    updatedAt, archived and every property at the top level, plus _hg_archived / archivedAt for
+    the archived feed (CustomObjectArchivedStream). tap.generate_stream_class makes one per
+    custom object, with its name, path (crm/v3/objects/<objectTypeId>/search), properties_url
+    (crm/v3/properties/<objectTypeId>) and the schema discovery built.
+    """
+
+    replication_key_filter = "hs_lastmodifieddate"
+    is_custom_stream = True
+    bulk_child_size = 1000
+
+
+class CustomObjectArchivedStream(ArchivedStream):
+    """A custom object's archived records (GET crm/v3/objects/<objectTypeId>?archived=true),
+    written under the object's own name with _hg_archived true; selected with it. Those
+    archived since the bookmark, as for the CRM objects' feeds."""
+
+    replication_key = "archivedAt"
+    primary_keys = ["id"]
+    is_custom_stream = True
+    parent_name = None  # the custom object's stream name
+
+    @property
+    def selected(self) -> bool:
+        catalog = self._tap.catalog
+        if not catalog.get(self.name) or not catalog.get(self.parent_name):
+            return False
+        try:
+            catalog[self.name] = catalog[self.parent_name]
+            self._metadata = catalog[self.parent_name].metadata
+            return self.mask.get((), False) or catalog[self.parent_name].metadata.get(()).selected
+        except Exception:
+            return self.mask.get((), False)
+
+    def _write_record_message(self, record: dict) -> None:
+        for record_message in self._generate_record_messages(record):
+            record_message.stream = self.parent_name
+            singer.write_message(record_message)
+
+    @property
+    def metadata(self):
+        new_metadata = super().metadata
+        if ("properties", "archivedAt") in new_metadata:
+            new_metadata[("properties", "archivedAt")].selected = True
+            new_metadata[("properties", "archivedAt")].selected_by_default = True
+        return new_metadata
+
+    def get_url_params(self, context, next_page_token):
+        params = super().get_url_params(context, next_page_token)
+        if len(urlencode(params)) > 3000:
+            # Archived rows only fill in (they never blank a column): ids and dates are enough.
+            params["properties"] = "hs_object_id,hs_lastmodifieddate,hs_createdate"
+        return params
+
+
 class ArchivedCompaniesStream(ArchivedStream):
     """Archived Companies Stream"""
 
