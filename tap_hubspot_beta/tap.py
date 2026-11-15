@@ -126,6 +126,7 @@ from tap_hubspot_beta.streams import (
     ChannelsStream,
     TranscriptsStream,
     MessagesStream,
+    PropertiesStream,
 )
 
  #When a new stream is added to the tap, it would break existing test suites.
@@ -304,6 +305,7 @@ STREAM_TYPES = add_streams([
     ChannelsStream,
     TranscriptsStream,
     MessagesStream,
+    PropertiesStream,
 ])
 
 
@@ -321,6 +323,8 @@ class Taphubspot(Tap):
     legacy_streams_mapping = {}
     associations_metadata = {}
     custom_objects_streams = set()
+    # The account's custom object types ({name, objectTypeId}), for the properties stream.
+    custom_object_types = []
 
     @classmethod
     def access_token_support(cls, connector=None):
@@ -418,6 +422,16 @@ class Taphubspot(Tap):
             description="false: the same as sync_strategy search (kept for older configs).",
         ),
         th.Property(
+            "include_archived_properties",
+            th.BooleanType,
+            default=False,
+            description=(
+                "CRM object streams also get the object's archived properties as columns (HubSpot "
+                "keeps an archived property 90 days, then deletes it), asked for by name like the "
+                "others. Off: only live properties, as before."
+            ),
+        ),
+        th.Property(
             "omit_null_properties",
             th.BooleanType,
             default=False,
@@ -445,6 +459,7 @@ class Taphubspot(Tap):
 
         streams = []
         custom_objects_streams = set()
+        custom_object_types = []
 
         # flag only used for testing purposes
         if self.config.get("discover_custom_objects", True):
@@ -458,8 +473,11 @@ class Taphubspot(Tap):
                         streams.append(archived_class(tap=self))
                     # add custom objects streams to the list to use it for associations
                     custom_objects_streams.add(record.get("fullyQualifiedName"))
+                    if not record.get("archived", False):
+                        custom_object_types.append({"name": record["name"], "objectTypeId": record["objectTypeId"]})
                 # add custom objects to tap
                 self.custom_objects_streams = custom_objects_streams
+                self.custom_object_types = custom_object_types
             except (FatalAPIError, InvalidCredentialsError) as exc:
                 self.logger.info(f"failed to discover custom objects. Error={exc}")
 

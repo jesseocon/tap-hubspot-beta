@@ -38,6 +38,11 @@ PROPERTIES = {
 CUSTOM = {"name": "deal_stages", "id": "4242", "objectTypeId": "2-4242", "fullyQualifiedName": "p99_deal_stages"}
 PROPERTIES[CUSTOM["objectTypeId"]] = ["stage", "pipeline_stage", "entered_at", "hs_createdate",
                                       "hs_lastmodifieddate", "hs_object_id"]
+# Archived properties (crm/v3/properties/<object>?archived=true only); records keep values.
+ARCHIVED_PROPERTIES = {"contacts": ["old_score_category"]}
+# Enumeration properties and their options (crm/v3/properties only).
+OPTIONS = {"lifecyclestage": [("subscriber", "Subscriber", 0, False), ("lead", "Lead", 1, False),
+                              ("customer", "Customer", 2, True)]}
 DATETIME_PROPS = {"createdate", "lastmodifieddate", "hs_lastmodifieddate", "closedate", "notes_last_updated",
                   "entered_at", "hs_createdate"}
 MODIFIED = {"contacts": "lastmodifieddate", "companies": "hs_lastmodifieddate", "deals": "hs_lastmodifieddate",
@@ -77,15 +82,20 @@ class FakeHubSpot:
         self.v4_inputs: List[List[dict]] = []
         self.history_inputs: List[List[dict]] = []
 
-    def custom_route(self, path: str, parts: List[str]):
+    def custom_route(self, path: str, parts: List[str], query: Optional[dict] = None):
         """Custom object schemas and properties (None: not one of those paths)."""
+        query = query or {}
         if path == "crm-object-schemas/v3/schemas":
             if CUSTOM["objectTypeId"] not in self.records:
                 return 200, {"results": []}
             return 200, {"results": [{**CUSTOM, "archived": False, "associations": [], "labels": {"singular": "Stage"},
                                       "properties": self._property_rows(CUSTOM["objectTypeId"])}]}
         if path.startswith("crm/v3/properties/") and parts[3] in PROPERTIES:
-            return 200, {"results": self._property_rows(parts[3])}
+            if query.get("archived") == "true":
+                return 200, {"results": [{"name": n, "type": "enumeration", "fieldType": "select", "archived": True,
+                                          "archivedAt": iso(BASE), "options": []}
+                                         for n in ARCHIVED_PROPERTIES.get(parts[3], [])]}
+            return 200, {"results": self._property_rows(parts[3], v3=True)}
         return None
 
     @staticmethod
@@ -110,7 +120,11 @@ class FakeHubSpot:
                     props[name] = str(rng.randint(100, 99999))
                 else:
                     props[name] = f"{name.title()} {i}"
-            rows.append({"id": rid, "properties": props, "known": set(PROPERTIES[obj]), "createdAt": iso(created),
+            for name in ARCHIVED_PROPERTIES.get(obj, []):
+                if i % 2 == 0:
+                    props[name] = f"Band {i % 3}"
+            rows.append({"id": rid, "properties": props, "known": set(PROPERTIES[obj]) | set(ARCHIVED_PROPERTIES.get(obj, [])),
+                         "createdAt": iso(created),
                          "updatedAt": props[MODIFIED[obj]], "archived": False})
         # One record HubSpot never set a modified date on: search's GT filter skips it.
         if rows:
@@ -118,9 +132,18 @@ class FakeHubSpot:
         return sorted(rows, key=lambda r: int(r["id"]))
 
     @staticmethod
-    def _property_rows(obj: str) -> List[dict]:
-        return [{"name": n, "type": "datetime" if n in DATETIME_PROPS else "string", "fieldType": "text"}
+    def _property_rows(obj: str, v3: bool = False) -> List[dict]:
+        rows = [{"name": n, "type": "datetime" if n in DATETIME_PROPS else "string", "fieldType": "text"}
                 for n in PROPERTIES.get(obj, [])]
+        if v3:
+            for i, row in enumerate(rows):
+                row.update({"label": row["name"].title(), "groupName": "info", "displayOrder": i, "archived": False,
+                            "hubspotDefined": True, "createdAt": iso(BASE), "updatedAt": iso(BASE),
+                            "modificationMetadata": {"archivable": True, "readOnlyDefinition": True,
+                                                     "readOnlyValue": False},
+                            "options": [{"value": v, "label": label, "displayOrder": order, "hidden": hidden}
+                                        for v, label, order, hidden in OPTIONS.get(row["name"], [])]})
+        return rows
 
     @staticmethod
     def _archived_rows(obj: str, count: int, rng: random.Random) -> List[dict]:
@@ -155,7 +178,7 @@ class FakeHubSpot:
         parts = path.split("/")
         if path.startswith("oauth/") or "access-tokens" in path or "token" in parts[-1]:
             return 200, {"scopes": ["crm.objects.contacts.read"], "access_token": "x", "expires_in": 3600}
-        custom = self.custom_route(path, parts)
+        custom = self.custom_route(path, parts, query)
         if custom is not None:
             return custom
         if path.startswith("properties/") or "/properties" in path:
