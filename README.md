@@ -42,6 +42,12 @@ tap-hubspot --about
   and reads by whichever is estimated faster. Under `auto_list_min_changed` (default 5,000)
   changed records it searches. Both read the same window and leave the same bookmark (the latest
   `updatedAt` written).
+- **Custom objects are CRM objects too.** Each one is read like contacts: by list on a first or
+  full sync, then since the bookmark (`updatedAt`, less `lookback_minutes`) by search or list. Its
+  archived records come from `<name>_archived` (`?archived=true`), under the object's own name, with
+  `_hg_archived` true. Records keep the full read's shape, with every property at the top level,
+  plus `_hg_archived` and `archivedAt`. A loader that replaced these tables whole must now merge
+  them on `id`.
 - **`omit_null_properties`** (default false): properties without a value are left out of RECORD
   messages. Use it with a loader that stores a missing property as null: the same rows, much less
   work. HubSpot leaves most properties of a wide object unset (84% of contacts' 1,859 columns on one

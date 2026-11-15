@@ -34,8 +34,14 @@ PROPERTIES = {
     "deals": ["dealname", "amount", "dealstage", "pipeline", "closedate", "createdate",
               "hs_lastmodifieddate", "hs_object_id"],
 }
-DATETIME_PROPS = {"createdate", "lastmodifieddate", "hs_lastmodifieddate", "closedate", "notes_last_updated"}
-MODIFIED = {"contacts": "lastmodifieddate", "companies": "hs_lastmodifieddate", "deals": "hs_lastmodifieddate"}
+# A custom object (only when FakeHubSpot is given custom=...): its type id is its path segment.
+CUSTOM = {"name": "deal_stages", "id": "4242", "objectTypeId": "2-4242", "fullyQualifiedName": "p99_deal_stages"}
+PROPERTIES[CUSTOM["objectTypeId"]] = ["stage", "pipeline_stage", "entered_at", "hs_createdate",
+                                      "hs_lastmodifieddate", "hs_object_id"]
+DATETIME_PROPS = {"createdate", "lastmodifieddate", "hs_lastmodifieddate", "closedate", "notes_last_updated",
+                  "entered_at", "hs_createdate"}
+MODIFIED = {"contacts": "lastmodifieddate", "companies": "hs_lastmodifieddate", "deals": "hs_lastmodifieddate",
+            CUSTOM["objectTypeId"]: "hs_lastmodifieddate"}
 
 
 def iso(dt: datetime) -> str:
@@ -48,38 +54,15 @@ def ms(value: str) -> int:
 
 class FakeHubSpot:
     def __init__(self, sizes: Dict[str, int], seed: int = 7, links_per_contact: int = 3,
-                 archived: Optional[Dict[str, int]] = None) -> None:
+                 archived: Optional[Dict[str, int]] = None, custom: int = 0) -> None:
         rng = random.Random(seed)
         self.records: Dict[str, List[dict]] = {}
+        sizes = dict(sizes)
+        if custom:
+            sizes[CUSTOM["objectTypeId"]] = custom
         # A fixed order, so the same sizes always give the same records.
-        for obj in [o for o in ("contacts", "companies", "deals") if o in sizes]:
-            count = sizes[obj]
-            rows = []
-            for i in range(count):
-                rid = str(1000 + i * 3 + rng.randint(0, 2))
-                created = BASE + timedelta(hours=rng.randint(0, 20000))
-                modified = created + timedelta(minutes=rng.randint(0, 90000))
-                props: Dict[str, Any] = {"hs_object_id": rid, "createdate": iso(created), MODIFIED[obj]: iso(modified)}
-                for name in PROPERTIES[obj]:
-                    if name in props:
-                        continue
-                    roll = rng.random()
-                    if roll < 0.2:
-                        continue  # never set
-                    if name in DATETIME_PROPS:
-                        props[name] = iso(created + timedelta(days=rng.randint(0, 400)))
-                    elif name == "email":
-                        props[name] = f"person{i}@example.test"
-                    elif name in ("amount", "annualrevenue"):
-                        props[name] = str(rng.randint(100, 99999))
-                    else:
-                        props[name] = f"{name.title()} {i}"
-                rows.append({"id": rid, "properties": props, "known": set(PROPERTIES[obj]), "createdAt": iso(created),
-                             "updatedAt": props[MODIFIED[obj]], "archived": False})
-            # One record HubSpot never set a modified date on: search's GT filter skips it.
-            if rows:
-                rows[-1]["properties"].pop(MODIFIED[obj], None)
-            self.records[obj] = sorted(rows, key=lambda r: int(r["id"]))
+        for obj in [o for o in ("contacts", "companies", "deals", CUSTOM["objectTypeId"]) if o in sizes]:
+            self.records[obj] = self._rows(obj, sizes[obj], rng)
         # from type -> to type -> from id -> to ids
         self.links: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
         for src, dst in (("contacts", "companies"), ("deals", "companies"), ("deals", "contacts")):
@@ -93,6 +76,51 @@ class FakeHubSpot:
         self.calls: List[dict] = []
         self.v4_inputs: List[List[dict]] = []
         self.history_inputs: List[List[dict]] = []
+
+    def custom_route(self, path: str, parts: List[str]):
+        """Custom object schemas and properties (None: not one of those paths)."""
+        if path == "crm-object-schemas/v3/schemas":
+            if CUSTOM["objectTypeId"] not in self.records:
+                return 200, {"results": []}
+            return 200, {"results": [{**CUSTOM, "archived": False, "associations": [], "labels": {"singular": "Stage"},
+                                      "properties": self._property_rows(CUSTOM["objectTypeId"])}]}
+        if path.startswith("crm/v3/properties/") and parts[3] in PROPERTIES:
+            return 200, {"results": self._property_rows(parts[3])}
+        return None
+
+    @staticmethod
+    def _rows(obj: str, count: int, rng: random.Random) -> List[dict]:
+        rows = []
+        for i in range(count):
+            rid = str(1000 + i * 3 + rng.randint(0, 2))
+            created = BASE + timedelta(hours=rng.randint(0, 20000))
+            modified = created + timedelta(minutes=rng.randint(0, 90000))
+            props: Dict[str, Any] = {"hs_object_id": rid, "createdate": iso(created), MODIFIED[obj]: iso(modified)}
+            for name in PROPERTIES[obj]:
+                if name in props:
+                    continue
+                roll = rng.random()
+                if roll < 0.2:
+                    continue  # never set
+                if name in DATETIME_PROPS:
+                    props[name] = iso(created + timedelta(days=rng.randint(0, 400)))
+                elif name == "email":
+                    props[name] = f"person{i}@example.test"
+                elif name in ("amount", "annualrevenue"):
+                    props[name] = str(rng.randint(100, 99999))
+                else:
+                    props[name] = f"{name.title()} {i}"
+            rows.append({"id": rid, "properties": props, "known": set(PROPERTIES[obj]), "createdAt": iso(created),
+                         "updatedAt": props[MODIFIED[obj]], "archived": False})
+        # One record HubSpot never set a modified date on: search's GT filter skips it.
+        if rows:
+            rows[-1]["properties"].pop(MODIFIED[obj], None)
+        return sorted(rows, key=lambda r: int(r["id"]))
+
+    @staticmethod
+    def _property_rows(obj: str) -> List[dict]:
+        return [{"name": n, "type": "datetime" if n in DATETIME_PROPS else "string", "fieldType": "text"}
+                for n in PROPERTIES.get(obj, [])]
 
     @staticmethod
     def _archived_rows(obj: str, count: int, rng: random.Random) -> List[dict]:
@@ -110,7 +138,7 @@ class FakeHubSpot:
 
     def send(self, session, request: requests.PreparedRequest, **_: Any) -> requests.Response:
         url = urlparse(request.url)
-        path = url.path.lstrip("/")
+        path = url.path.strip("/")
         query = {k: v[-1] for k, v in parse_qs(url.query).items()}
         body = json.loads(request.body) if request.body and request.body[:1] in (b"{", "{") else None
         self.calls.append({"method": request.method, "path": path, "query": query, "body": body})
@@ -127,6 +155,9 @@ class FakeHubSpot:
         parts = path.split("/")
         if path.startswith("oauth/") or "access-tokens" in path or "token" in parts[-1]:
             return 200, {"scopes": ["crm.objects.contacts.read"], "access_token": "x", "expires_in": 3600}
+        custom = self.custom_route(path, parts)
+        if custom is not None:
+            return custom
         if path.startswith("properties/") or "/properties" in path:
             obj = parts[2] if path.startswith("properties/v1/") else ""
             return 200, [{"name": n, "type": "datetime" if n in DATETIME_PROPS else "string",

@@ -16,7 +16,7 @@ from tap_hubspot_beta.client_base import TapHubspotDailyAPIQuotaExceededExceptio
 
 from tap_hubspot_beta.auth import OAuth2Authenticator
 from tap_hubspot_beta.utils import can_read_property_values, resolve_oauth_scopes
-from tap_hubspot_beta.client_v3 import hubspotV3Stream, DynamicDiscoveredHubspotV3Stream
+from tap_hubspot_beta.client_v3 import hubspotV3Stream
 from tap_hubspot_beta.streams import (
     AccountStream,
     AssociationDealsCompaniesStream,
@@ -113,6 +113,8 @@ from tap_hubspot_beta.streams import (
     GeolocationSummaryMonthlyStream,
     LeadsStream,
     DiscoverCustomObjectsStream,
+    CustomObjectStream,
+    CustomObjectArchivedStream,
     ArchivedContactsStream,
     GoalTargetsStream,
     OrdersStream,
@@ -451,6 +453,9 @@ class Taphubspot(Tap):
                 for record in discover_stream.get_records(context={}):
                     stream_class = self.generate_stream_class(record)
                     streams.append(stream_class(tap=self))
+                    archived_class = self.generate_archived_stream_class(record, stream_class)
+                    if archived_class is not None:
+                        streams.append(archived_class(tap=self))
                     # add custom objects streams to the list to use it for associations
                     custom_objects_streams.add(record.get("fullyQualifiedName"))
                 # add custom objects to tap
@@ -571,22 +576,38 @@ class Taphubspot(Tap):
         schema, associations_metadata = self.generate_schema(properties, associations, object_type_id)
         self.associations_metadata[name] = associations_metadata
 
+        # Read like the CRM objects (CustomObjectStream): since the bookmark, by search or list.
         return type(
             class_name,
-            (DynamicDiscoveredHubspotV3Stream,),
+            (CustomObjectStream,),
             {
                 "name": name,
-                "path": f"crm/v3/objects/{object_type_id}/",
-                "records_jsonpath": "$.results[*]",
-                "primary_keys": ["id"],
-                "replication_key": "updatedAt",
-                "page_size": 100,
+                "path": f"crm/v3/objects/{object_type_id}/search",
+                "properties_url": f"crm/v3/properties/{object_type_id}",
                 "schema": schema,
-                "is_custom_stream": True,
                 "object_id": custom_object.get("id"),
                 "fullyQualifiedName": custom_object.get("fullyQualifiedName"),
                 "associations_metadata": associations_metadata,
                 "stream_object_type": custom_object.get("fullyQualifiedName")
+            },
+        )
+
+    def generate_archived_stream_class(self, custom_object: Dict[str, Any], stream_class):
+        """The custom object's archived records (none for an archived custom object type)."""
+        if custom_object.get("archived", False):
+            return None
+        object_type_id = custom_object.get("objectTypeId")
+        name = f"{stream_class.name}_archived"
+        return type(
+            "".join(word.capitalize() for word in name.split("_")) + "Stream",
+            (CustomObjectArchivedStream,),
+            {
+                "name": name,
+                "parent_name": stream_class.name,
+                "path": f"crm/v3/objects/{object_type_id}?archived=true",
+                "properties_url": f"crm/v3/properties/{object_type_id}",
+                "schema": stream_class.schema,
+                "stream_object_type": custom_object.get("fullyQualifiedName"),
             },
         )
     
@@ -595,7 +616,10 @@ class Taphubspot(Tap):
             th.Property("id", th.StringType),
             th.Property("updatedAt", th.DateTimeType), 
             th.Property("createdAt", th.DateTimeType), 
-            th.Property("archived", th.BooleanType)
+            th.Property("archived", th.BooleanType),
+            # The archived feed's marks, as on the CRM objects (CustomObjectArchivedStream).
+            th.Property("_hg_archived", th.BooleanType),
+            th.Property("archivedAt", th.DateTimeType),
         ]
         main_properties = [p.name for p in properties_list]
 
