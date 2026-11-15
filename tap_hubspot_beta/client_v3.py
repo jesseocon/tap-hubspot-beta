@@ -944,8 +944,30 @@ class hubspotHistoryV3Stream(hubspotV3Stream):
         row = super().post_process(row, context)
         props = row.get("propertiesWithHistory") or dict()
         row["propertiesWithHistory"] = {k:v for (k,v) in props.items() if v}
-        row = {k:v for k,v in row.items() if k in ["id", "propertiesWithHistory", "createdAt", "updatedAt", "archived", "archivedAt"]}
+        row["property_history"] = self.property_history(row["propertiesWithHistory"])
+        row = {k:v for k,v in row.items() if k in ["id", "propertiesWithHistory", "property_history", "createdAt", "updatedAt", "archived", "archivedAt"]}
         return row
+
+    @staticmethod
+    def property_history(history: dict) -> List[dict]:
+        """propertiesWithHistory as one row per version (the property's name, then HubSpot's
+        fields), so the warehouse gets them as a child table (Fivetran's deal_stage: one row
+        per dealstage version)."""
+        out = []
+        for name in sorted(history):
+            for version in history[name] or []:
+                if not isinstance(version, dict):
+                    continue
+                out.append({
+                    "property": name,
+                    "value": version.get("value"),
+                    "timestamp": version.get("timestamp"),
+                    "sourceType": version.get("sourceType"),
+                    "sourceId": version.get("sourceId"),
+                    "sourceLabel": version.get("sourceLabel"),
+                    "updatedByUserId": version.get("updatedByUserId"),
+                })
+        return out
     
     def _write_schema_message(self) -> None:
         """Write out a SCHEMA message with the stream schema."""

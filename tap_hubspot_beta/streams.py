@@ -759,6 +759,100 @@ class FormSubmissionsStream(hubspotV1PagingStream):
         return row
 
 
+# One version of a property (hubspotHistoryV3Stream.property_history).
+PROPERTY_HISTORY = th.ArrayType(th.ObjectType(
+    th.Property("property", th.StringType),
+    th.Property("value", th.StringType),
+    th.Property("timestamp", th.DateTimeType),
+    th.Property("sourceType", th.StringType),
+    th.Property("sourceId", th.StringType),
+    th.Property("sourceLabel", th.StringType),
+    th.Property("updatedByUserId", th.IntegerType),
+))
+
+
+class PropertiesStream(hubspotV3Stream):
+    """Property definitions of contacts, companies, deals and the account's custom objects
+    (GET crm/v3/properties/<object>, then the same with archived=true), one row per property
+    with its options as a list. Fivetran's property and property_option tables: objectType is
+    its hubspot_object (contact, company, deal, or the custom object's name)."""
+
+    name = "properties"
+    path = "crm/v3/properties/{object}"
+    primary_keys = ["objectType", "name"]
+    replication_key = None
+    # (objectType, objectTypeId) of the built-in objects; custom objects come from discovery.
+    OBJECTS = [("contact", "0-1", "contacts"), ("company", "0-2", "companies"), ("deal", "0-3", "deals")]
+
+    schema = th.PropertiesList(
+        th.Property("objectType", th.StringType),
+        th.Property("objectTypeId", th.StringType),
+        th.Property("name", th.StringType),
+        th.Property("label", th.StringType),
+        th.Property("type", th.StringType),
+        th.Property("fieldType", th.StringType),
+        th.Property("description", th.StringType),
+        th.Property("groupName", th.StringType),
+        th.Property("options", th.ArrayType(th.ObjectType(
+            th.Property("label", th.StringType),
+            th.Property("value", th.StringType),
+            th.Property("description", th.StringType),
+            th.Property("displayOrder", th.IntegerType),
+            th.Property("hidden", th.BooleanType),
+        ))),
+        th.Property("displayOrder", th.IntegerType),
+        th.Property("calculated", th.BooleanType),
+        th.Property("calculationFormula", th.StringType),
+        th.Property("externalOptions", th.BooleanType),
+        th.Property("hasUniqueValue", th.BooleanType),
+        th.Property("hidden", th.BooleanType),
+        th.Property("formField", th.BooleanType),
+        th.Property("hubspotDefined", th.BooleanType),
+        th.Property("showCurrencySymbol", th.BooleanType),
+        th.Property("referencedObjectType", th.StringType),
+        th.Property("dataSensitivity", th.StringType),
+        th.Property("modificationMetadata", th.ObjectType(
+            th.Property("archivable", th.BooleanType),
+            th.Property("readOnlyDefinition", th.BooleanType),
+            th.Property("readOnlyValue", th.BooleanType),
+            th.Property("readOnlyOptions", th.BooleanType),
+        )),
+        th.Property("createdUserId", th.StringType),
+        th.Property("updatedUserId", th.StringType),
+        th.Property("createdAt", th.DateTimeType),
+        th.Property("updatedAt", th.DateTimeType),
+        th.Property("archived", th.BooleanType),
+        th.Property("archivedAt", th.DateTimeType),
+    ).to_dict()
+
+    @property
+    def partitions(self) -> List[dict]:
+        objects = list(self.OBJECTS)
+        objects += [(o["name"], o["objectTypeId"], o["objectTypeId"]) for o in getattr(self._tap, "custom_object_types", [])]
+        return [
+            {"objectType": name, "objectTypeId": type_id, "object": path, "archived": archived}
+            for name, type_id, path in objects
+            for archived in (False, True)
+        ]
+
+    def get_url_params(self, context: Optional[dict], next_page_token: Optional[Any]) -> Dict[str, Any]:
+        return {"archived": "true" if (context or {}).get("archived") else "false"}
+
+    def get_records(self, context: Optional[dict]) -> Iterable[Dict[str, Any]]:
+        try:
+            yield from super().get_records(context)
+        except InvalidCredentialsError as exc:
+            # A sign-in without that object's schema scope: the other objects still sync.
+            self.logger.warning("properties: %s skipped: %s", context.get("objectType"), exc)
+
+    def post_process(self, row: dict, context: Optional[dict]) -> dict:
+        row = super().post_process(row, context)
+        row["objectType"] = context["objectType"]
+        row["objectTypeId"] = context["objectTypeId"]
+        row["archived"] = bool(row.get("archived") or context.get("archived"))
+        return row
+
+
 class OwnersStream(hubspotV3Stream):
     """Owners Stream"""
 
@@ -1140,6 +1234,7 @@ class ContactsHistoryPropertiesStream(hubspotHistoryV3Stream):
         th.Property("archived", th.BooleanType),
         th.Property("archivedAt", th.DateTimeType),
         th.Property("propertiesWithHistory", th.CustomType({"type": ["object", "string"]})),
+        th.Property("property_history", PROPERTY_HISTORY),
     ]
 
 
@@ -1470,6 +1565,8 @@ class DealsHistoryPropertiesStream(hubspotHistoryV3Stream):
     path = "crm/v3/objects/deals/batch/read"
     properties_url = "properties/v1/deals/properties"
     parent_stream_type = DealsStream
+    # The deal's id, as contacts_history_properties: property_history's child rows carry it.
+    primary_keys = ["id"]
 
     base_properties = [
         th.Property("id", th.StringType),
@@ -1478,6 +1575,7 @@ class DealsHistoryPropertiesStream(hubspotHistoryV3Stream):
         th.Property("archived", th.BooleanType),
         th.Property("archivedAt", th.DateTimeType),
         th.Property("propertiesWithHistory", th.CustomType({"type": ["object", "string"]})),
+        th.Property("property_history", PROPERTY_HISTORY),
     ]
 
 

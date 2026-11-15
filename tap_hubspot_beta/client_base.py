@@ -740,7 +740,11 @@ class hubspotStream(RESTStream):
                 if not field.get("deleted"):
                     property = th.Property(field_name, self.extract_type(field))
                     properties.append(property)
-        
+
+        # include_archived_properties: archived properties are columns too (their values are
+        # asked for by name like any other property).
+        properties.extend(self.archived_property_columns({p.name.lower() for p in properties}))
+
         # get crm objects associations metadata
         associations_to_fetch = self.get_associations_to_fetch()
         if associations_to_fetch and self.stream_object_type in associations_to_fetch:
@@ -749,6 +753,53 @@ class hubspotStream(RESTStream):
                 properties.append(th.Property(association, th.StringType))
 
         return th.PropertiesList(*properties).to_dict()
+
+    _ARCHIVED_OBJECT = re.compile(r"^(?:crm/v3/properties/([^/?]+)|properties/v\d+/([^/]+)/properties)")
+
+    @property
+    def archived_properties_path(self) -> Optional[str]:
+        """crm/v3/properties/<object>?archived=true for a CRM object stream (crm/v3/objects/...)
+        when the config has include_archived_properties, else None."""
+        if not self.config.get("include_archived_properties"):
+            return None
+        if not (self.path or "").startswith("crm/v3/objects/"):
+            return None
+        match = self._ARCHIVED_OBJECT.match(self.properties_url or "")
+        if not match:
+            return None
+        return f"crm/v3/properties/{match.group(1) or match.group(2)}?archived=true"
+
+    def archived_property_columns(self, have: set) -> List[th.Property]:
+        """The object's archived properties (HubSpot keeps them 90 days before deleting them
+        for good) as columns, less the names in `have` (lower case) and those the connection
+        lacks the scopes to read. One call per stream; none without include_archived_properties."""
+        path = self.archived_properties_path
+        if not path:
+            return []
+        headers = dict(self.http_headers)
+        headers.update(self.authenticator.auth_headers or {})
+        response = self.request_decorator(self.request_schema, backoff_max_tries_override=10)(
+            self.url_base + path, headers=headers
+        )
+        if not response:
+            return []
+        payload = response.json()
+        fields = payload.get("results", []) if isinstance(payload, dict) else payload
+        filter_sensitive = self.exclude_unauthorized_sensitive_properties()
+        scopes = self.oauth_scopes if filter_sensitive else frozenset()
+        object_type = self.sensitive_scope_object_type()
+        columns = []
+        for field in fields or []:
+            name = field.get("name")
+            if not name or name.lower() in have:
+                continue
+            if filter_sensitive and not can_read_property_values(field, scopes, object_type):
+                continue
+            have.add(name.lower())
+            columns.append(th.Property(name, self.extract_type(field)))
+        if columns:
+            self.logger.info("%s: %s archived properties added as columns", self.name, len(columns))
+        return columns
 
     def finalize_state_progress_markers(self, state: Optional[dict] = None) -> None: # noqa: C901
 

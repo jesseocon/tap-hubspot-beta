@@ -48,6 +48,17 @@ tap-hubspot --about
   `_hg_archived` true. Records keep the full read's shape, with every property at the top level,
   plus `_hg_archived` and `archivedAt`. A loader that replaced these tables whole must now merge
   them on `id`.
+- **Property definitions (`properties`).** One row per property of contacts, companies, deals and
+  each custom object (`crm/v3/properties/<object>`, then `?archived=true`): `objectType` (`contact`,
+  `company`, `deal` or the custom object's name), `objectTypeId`, the definition's fields, and its
+  `options` (value, label, displayOrder, hidden, description) as a list. Two calls per object per run.
+- **`include_archived_properties`** (default false): CRM object streams also get the object's
+  archived properties as columns (one more properties call per stream), asked for by name like the
+  rest. HubSpot deletes an archived property for good 90 days after it was archived.
+- **Property history as rows.** `contacts_history_properties` and `deals_history_properties` add
+  `property_history`, one item per version (`property`, `value`, `timestamp`, `sourceType`,
+  `sourceId`, `sourceLabel`, `updatedByUserId`), next to `propertiesWithHistory`. Both are keyed on
+  `id`.
 - **`omit_null_properties`** (default false): properties without a value are left out of RECORD
   messages. Use it with a loader that stores a missing property as null: the same rows, much less
   work. HubSpot leaves most properties of a wide object unset (84% of contacts' 1,859 columns on one
