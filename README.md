@@ -42,6 +42,11 @@ tap-hubspot --about
   and reads by whichever is estimated faster. Under `auto_list_min_changed` (default 5,000)
   changed records it searches. Both read the same window and leave the same bookmark (the latest
   `updatedAt` written).
+- **Records changed during the sync are read.** The window has no end unless the config sets
+  `end_date`: search's last time bucket is open, and the list API keeps every record changed since
+  the start. A record changed while the sync runs used to leave the bucket it was counted in and
+  land in none, so that run missed it, and the next one did too if it changed again during that
+  run. The bookmark stays at the sync's start, so the next run re-reads from there.
 - **Custom objects are CRM objects too.** Each one is read like contacts: by list on a first or
   full sync, then since the bookmark (`updatedAt`, less `lookback_minutes`) by search or list. Its
   archived records come from `<name>_archived` (`?archived=true`), under the object's own name, with
