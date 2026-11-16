@@ -79,6 +79,9 @@ class FakeHubSpot:
         # Archived records (list with archived=true), only when asked for: obj -> rows.
         self.archived = {obj: self._archived_rows(obj, count, rng) for obj, count in (archived or {}).items()}
         self.calls: List[dict] = []
+        # Called before each request is answered (method, path, query, body): a test changes
+        # records there, as HubSpot users do while a sync runs.
+        self.on_request = None
         self.v4_inputs: List[List[dict]] = []
         self.history_inputs: List[List[dict]] = []
 
@@ -165,6 +168,8 @@ class FakeHubSpot:
         query = {k: v[-1] for k, v in parse_qs(url.query).items()}
         body = json.loads(request.body) if request.body and request.body[:1] in (b"{", "{") else None
         self.calls.append({"method": request.method, "path": path, "query": query, "body": body})
+        if self.on_request is not None:
+            self.on_request(request.method, path, query, body)
         status, payload = self.route(request.method, path, query, body)
         response = requests.Response()
         response.status_code = status
@@ -218,6 +223,12 @@ class FakeHubSpot:
         out = {k: record[k] for k in ("id", "createdAt", "updatedAt", "archived", "archivedAt") if k in record}
         out["properties"] = self._props(record, requested, nulls)
         return out
+
+    def touch(self, obj: str, rid: str, when: datetime) -> None:
+        """The record changed at `when` (its modified property and updatedAt)."""
+        record = next(r for r in self.records[obj] if r["id"] == rid)
+        record["properties"][MODIFIED[obj]] = iso(when)
+        record["updatedAt"] = iso(when)
 
     def search(self, obj: str, body: dict) -> dict:
         rows = self.records[obj]

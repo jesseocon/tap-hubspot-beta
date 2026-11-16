@@ -242,6 +242,14 @@ class hubspotV3SearchStream(hubspotStream):
 
         for bucket in buckets:
             bucket["last_record_id"] = "0"
+        # The last bucket has no end (unless the config sets end_date): a record changed while
+        # the sync runs has left the bucket it was counted in, and its new time is after the
+        # end the buckets were cut at. With an end it was in no bucket and missed by this run
+        # (and by the next too, if it changed again while that one ran). Open, it is read in
+        # the last bucket, which is paged last. The bookmark stays at the sync's start (the
+        # signpost), so the next run re-reads from there.
+        if buckets and self.get_end_time(curr_date_fallback=False) is None:
+            buckets[-1]["end_time"] = None
 
         self.logger.info(f"Total buckets created: {len(buckets)} with total records: {sum([b['bucket_size'] for b in buckets])}")
         self.logger.info(buckets)
@@ -531,7 +539,10 @@ class hubspotV3SearchStream(hubspotStream):
     def _request_records_list(self, context: Optional[dict]) -> Iterable[dict]:
         decorated_request = self.request_decorator(self._request)
         requested = self._list_properties()
-        start, end = self._window_ms(context)
+        # No end unless the config sets end_date: a record changed while the list pages run is
+        # read too (as search's open last bucket). The bookmark stays at the sync's start.
+        start, _ = self._window_ms(context)
+        end = self.get_end_time(curr_date_fallback=False)
         batch_read = self._list_needs_batch_read()
         params = {"limit": self.LIST_PAGE_SIZE, "archived": "false", "properties": ",".join(requested)}
         # With batch read, the list call only pages ids (and the window's property).
