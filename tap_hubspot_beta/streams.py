@@ -18,6 +18,7 @@ from hotglue_singer_sdk import typing as th
 from pendulum import parse
 
 from tap_hubspot_beta.privacy import describe_context
+from tap_hubspot_beta import stats as sync_stats
 from tap_hubspot_beta.client_base import ChildPipeline, hubspotStream, hubspotStreamSchema
 from tap_hubspot_beta.client_v1 import hubspotV1Stream, hubspotV1SplitUrlStream, hubspotV1PagingStream
 from tap_hubspot_beta.client_v4 import hubspotV4Stream, association_schema
@@ -1242,6 +1243,12 @@ class ArchivedStream(hubspotV3Stream):
 
     visible_in_catalog = False
     prefetch_pages = True
+
+    def _generate_record_messages(self, record: dict):
+        # The feeds write their records under the parent's name (their own _write_record_message),
+        # past hubspotStream's count: counted here, so a run's summary shows what each feed found.
+        sync_stats.get().records(self.name, 1)
+        yield from super()._generate_record_messages(record)
 
     def post_process(self, row, context):
         canonical_id = row.pop("id", None)

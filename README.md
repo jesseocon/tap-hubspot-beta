@@ -71,7 +71,9 @@ tap-hubspot --about
 - **Logs.** Each decision is logged (`contacts: 182,400 changed since 2026-11-13T09:00Z of 190,112 -> list
   (est. 5m47s vs 9m07s by search)`). At the end of each stream and of the run there is a summary:
   records, requests per endpoint, average latency, 429s, time waited for the budget, wall and CPU
-  time. The same numbers follow as JSON on a `SYNC_SUMMARY` line.
+  time. The same numbers follow as JSON on a `SYNC_SUMMARY` line. The archived feeds
+  (`contacts_v3_archived`, `deals_archived`, `<name>_archived`, ...) count the records they found
+  under their own name, though the records go out under the object's name.
 
 ### Source Authentication and Authorization
 
