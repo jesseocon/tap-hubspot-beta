@@ -599,6 +599,94 @@ class hubspotV3SearchStream(hubspotStream):
     # the reading thread only.
     prefetch_pages = True
 
+    # --- key scans ------------------------------------------------------------------------
+    #
+    # A record deleted for good (an emptied recycle bin, a GDPR deletion) leaves every feed: the
+    # live list and search, the archived list, and no record lists it as merged. Every
+    # key_scan_interval_hours (or when key_scan is set), a stream read since its bookmark also
+    # pages every live id through the list API (one property, 100 a page) and, only once the
+    # whole listing came back, writes each id as {id, _sdc_key_only: true} after the stream's
+    # records. A loader that sees them marks the rows it holds whose ids were not listed
+    # (aria-singer-taps: the merge strategy's key_only). A listing that fails or finds nothing
+    # writes no ids, so nothing is marked, and the scan stays due for the next run. A sync with
+    # no bookmark (a first sync, a full refresh) lists every record anyway: no scan, but the
+    # time is kept as the last one.
+
+    KEY_ONLY_COLUMN = "_sdc_key_only"
+    KEY_SCAN_BOOKMARK = "key_scan_at"
+
+    def key_scans_on(self) -> bool:
+        configured = self.config.get("key_scan") in (True, "true") or bool(self.config.get("key_scan_interval_hours"))
+        return configured and self.list_api_supported(None)
+
+    def key_scan_due(self, now: datetime) -> bool:
+        if not self.key_scans_on():
+            return False
+        if self.config.get("key_scan") in (True, "true"):
+            return True
+        hours = float(self.config.get("key_scan_interval_hours") or 0)
+        if hours <= 0:
+            return False
+        last = self.stream_state.get(self.KEY_SCAN_BOOKMARK)
+        if not last:
+            return True
+        try:
+            return now - parse(last) >= timedelta(hours=hours)
+        except Exception:
+            return True
+
+    def _generate_schema_messages(self):
+        """The stream's SCHEMA, with _sdc_key_only when it scans keys."""
+        for message in super()._generate_schema_messages():
+            if self.key_scans_on():
+                schema = dict(message.schema)
+                schema["properties"] = {**schema.get("properties", {}), self.KEY_ONLY_COLUMN: {"type": ["null", "boolean"]}}
+                message.schema = schema
+            yield message
+
+    def _list_live_ids(self) -> List[str]:
+        """Every live id, in the list API's order; raises if any page fails."""
+        decorated_request = self.request_decorator(self._request)
+        params = {"limit": self.LIST_PAGE_SIZE, "archived": "false", "properties": "hs_object_id"}
+        ids: List[str] = []
+        seen = set()
+        after = None
+        while True:
+            page_params = dict(params)
+            if after:
+                page_params["after"] = after
+            body = decorated_request(self._list_request(page_params), None).json()
+            for result in body.get("results", []):
+                rid = str(result.get("id") or "")
+                if rid and rid not in seen:
+                    seen.add(rid)
+                    ids.append(rid)
+            next_after = ((body.get("paging") or {}).get("next") or {}).get("after")
+            if not next_after or next_after == after:
+                return ids
+            after = next_after
+
+    def _key_scan(self, started: datetime) -> None:
+        from tap_hubspot_beta import stats as sync_stats
+
+        try:
+            ids = self._list_live_ids()
+        except Exception as exc:
+            # Never part of a listing: the rows it left out would read as deleted.
+            self.logger.warning("%s: key scan stopped (%s); no ids written, nothing marked", self.name, type(exc).__name__)
+            return
+        if not ids:
+            self.logger.warning("%s: key scan listed no ids; none written, nothing marked", self.name)
+            return
+        alias = self.stream_maps[0].stream_alias
+        for rid in ids:
+            singer.write_message(
+                singer.RecordMessage(stream=alias, record={"id": rid, self.KEY_ONLY_COLUMN: True}, time_extracted=started)
+            )
+        sync_stats.get().records(f"{self.name}_key_scan", len(ids))
+        self.logger.info("%s: key scan listed %s live ids", self.name, f"{len(ids):,}")
+        self.stream_state[self.KEY_SCAN_BOOKMARK] = started.isoformat()
+
     def request_records(self, context: Optional[dict]) -> Iterable[dict]:
         if self.use_list_api(context):
             yield from self._request_records_list(context)
@@ -634,6 +722,10 @@ class hubspotV3SearchStream(hubspotStream):
         context_list: Optional[List[dict]]
         context_list = [context] if context is not None else self.partitions
         selected = self.selected
+        # Decided before the sync moves the bookmark (key scans, above).
+        started = datetime.now(timezone.utc)
+        key_scan = selected and not context and self._has_bookmark(None) and self.key_scan_due(started)
+        listed_all = selected and not context and not self._has_bookmark(None) and self.key_scans_on()
         # Child batches are read on the worker pool and written in order (ChildPipeline).
         children = ChildPipeline(self, fallback=self._sync_child)
 
@@ -726,6 +818,10 @@ class hubspotV3SearchStream(hubspotStream):
             # Finalize total stream only if we have the full full context.
             # Otherwise will be finalized by tap at end of sync.
             finalize_state_progress_markers(self.stream_state)
+        if key_scan:
+            self._key_scan(started)
+        elif listed_all:
+            self.stream_state[self.KEY_SCAN_BOOKMARK] = started.isoformat()
         self._write_record_count_log(record_count=record_count, context=context)
         # Reset interim bookmarks before emitting final STATE message:
         self._write_state_message()

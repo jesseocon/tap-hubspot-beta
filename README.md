@@ -60,6 +60,15 @@ tap-hubspot --about
 - **`include_archived_properties`** (default false): CRM object streams also get the object's
   archived properties as columns (one more properties call per stream), asked for by name like the
   rest. HubSpot deletes an archived property for good 90 days after it was archived.
+- **Key scans (`key_scan_interval_hours`, `key_scan`).** A record deleted for good (an emptied
+  recycle bin, a GDPR deletion) is in no feed: not live, not archived, not merged. Every
+  `key_scan_interval_hours` (unset: never; `key_scan: true`: this run), a CRM object stream read
+  since its bookmark also lists every live id (`?archived=false&properties=hs_object_id`, 100 a
+  page) and, once the whole listing came back, writes each as `{id, _sdc_key_only: true}` after the
+  stream's records (the SCHEMA gets `_sdc_key_only`). A loader marks the rows it holds whose ids
+  were not listed. A listing that fails or finds nothing writes no ids and stays due; the time of
+  the last one is `key_scan_at` in the stream's state (a sync with no bookmark lists everything and
+  sets it).
 - **Property history as rows.** `contacts_history_properties` and `deals_history_properties` add
   `property_history`, one item per version (`property`, `value`, `timestamp`, `sourceType`,
   `sourceId`, `sourceLabel`, `updatedByUserId`), next to `propertiesWithHistory`. Both are keyed on
