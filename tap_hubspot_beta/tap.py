@@ -422,6 +422,23 @@ class Taphubspot(Tap):
             description="false: the same as sync_strategy search (kept for older configs).",
         ),
         th.Property(
+            "key_scan_interval_hours",
+            th.NumberType,
+            description=(
+                "CRM object streams read since their bookmark also list every live record id this "
+                "often (hours; unset or 0: never), written after the stream's records as "
+                "{id, _sdc_key_only: true}, so a loader can mark the records it holds that HubSpot "
+                "no longer has (deleted for good: an emptied recycle bin, a GDPR deletion). Only a "
+                "complete listing is written."
+            ),
+        ),
+        th.Property(
+            "key_scan",
+            th.BooleanType,
+            default=False,
+            description="true: list every live id this run (key_scan_interval_hours aside).",
+        ),
+        th.Property(
             "include_archived_properties",
             th.BooleanType,
             default=False,
