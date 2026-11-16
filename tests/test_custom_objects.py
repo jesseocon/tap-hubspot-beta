@@ -104,10 +104,13 @@ def test_archived_records_come_under_the_objects_name(tmp_path):
     # As with the CRM objects' feeds, no record carries the feed's own name.
     feed = custom_run(tmp_path, FakeHubSpot(SIZES, custom=20, archived={TYPE: 130}))
     assert not [m for m in feed if m.get("type") == "RECORD" and m["stream"] == f"{NAME}_archived"]
+    # The feed's summary counts them (they go out under the object's name).
+    assert stats.get().stream_summary(f"{NAME}_archived")["records"] == {f"{NAME}_archived": 130}
     # With the feed's bookmark, only those archived since.
     state = {"bookmarks": {f"{NAME}_archived": {"replication_key": "archivedAt", "replication_key_value": SINCE}}}
     since = [r for r in rows(custom_run(tmp_path, FakeHubSpot(SIZES, custom=20, archived={TYPE: 130}), state=state)) if r["_hg_archived"]]
     assert 0 < len(since) == len([r for r in fake.archived[TYPE] if r["archivedAt"] > "2025-06-01"]) < 130
+    assert stats.get().stream_summary(f"{NAME}_archived")["records"] == {f"{NAME}_archived": len(since)}
 
 
 def test_the_catalog_marks_the_object_and_hides_its_feed(tmp_path):
