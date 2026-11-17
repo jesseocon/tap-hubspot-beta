@@ -207,6 +207,11 @@ class _Estimating(hubspotV3SearchStream):
     def _list_needs_batch_read(self):
         return True
 
+    width = 10
+
+    def _list_properties(self):
+        return [f"p{i}" for i in range(self.width)]
+
 
 def test_the_estimate():
     stats.reset()
@@ -215,6 +220,24 @@ def test_the_estimate():
     est = stream.estimate_seconds(182_400, 190_112)
     assert est["list"] < est["search"]
     # A day's changes on a large portal: search.
+    est = stream.estimate_seconds(5_000, 425_000)
+    assert est["search"] < est["list"]
+
+
+def test_wide_objects_page_slower_through_search():
+    """FourthRev, 2026-11-16 05:00: HubSpot's nightly update touched every contact (1,638
+    properties). Timed only by its one-result count calls (~0.25s), search looked like 9 minutes
+    and was chosen; its 2,418 pages took 1.72s each. By width, list is chosen."""
+    stats.reset()
+    stream = _Estimating()
+    stream.width = 1_638
+    est = stream.estimate_seconds(427_648, 427_649)
+    assert est["search"] > 3_000 and est["list"] < est["search"]
+    # A normal run's few thousand changes still go by search.
+    est = stream.estimate_seconds(11_849, 427_649)
+    assert est["search"] < est["list"]
+    # Narrow objects keep the old estimate's answer.
+    stream.width = 10
     est = stream.estimate_seconds(5_000, 425_000)
     assert est["search"] < est["list"]
 

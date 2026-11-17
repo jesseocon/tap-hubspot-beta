@@ -352,6 +352,12 @@ class hubspotV3SearchStream(hubspotStream):
     # Seconds per call, for the estimate before any call of the kind was timed in this run
     # (Design Center, 2026-11-14: list ids 0.13s, batch read of 1,850 properties 0.75s).
     DEFAULT_SECONDS = {"search": 0.6, "list": 0.15, "list_full": 0.4, "batch_read": 0.75}
+    # A search page of 200 records carries every requested property, set or not, so its time
+    # grows with the property count. Fitted on FourthRev (2026-11-16, 2,418 contact pages of
+    # 1,638 properties: 1.72s average; 2,631 deal pages of ~830: 0.86s). The run's own search
+    # average can't stand in: before the decision only the one-result count calls are timed.
+    SEARCH_PAGE_BASE_SECONDS = 0.25
+    SEARCH_PAGE_SECONDS_PER_PROPERTY = 0.00083
 
     @property
     def hubspot_property_names(self) -> List[str]:
@@ -451,6 +457,11 @@ class hubspotV3SearchStream(hubspotStream):
                 return measured
         return self.DEFAULT_SECONDS[kind]
 
+    def _search_page_seconds(self) -> float:
+        """Seconds per search page: by its width, or what this run's pages took if that was more."""
+        width = self.SEARCH_PAGE_BASE_SECONDS + self.SEARCH_PAGE_SECONDS_PER_PROPERTY * len(self._list_properties())
+        return max(width, self._seconds_per_call("search"))
+
     def estimate_seconds(self, changed: int, total: int) -> dict:
         """Rough seconds to read `changed` of `total` records by search and by list.
 
@@ -464,7 +475,7 @@ class hubspotV3SearchStream(hubspotStream):
         buckets = math.ceil(changed / self.max_bucket_size) if changed > self.max_bucket_size else 0
         # Splitting a window costs two count requests a level, about two levels a bucket.
         search_calls = pages + 4 * buckets
-        search = max(search_calls / search_per_s, pages * self._seconds_per_call("search"))
+        search = max(search_calls / search_per_s, pages * self._search_page_seconds())
 
         list_pages = math.ceil(total / self.LIST_PAGE_SIZE)
         if self._list_needs_batch_read():
