@@ -112,7 +112,7 @@ class BulkHubSpot(FakeHubSpot):
         props.update({modified: CHANGED_AT, "createdate": "2024-01-01T00:00:00.000Z", "hs_object_id": str(rid)})
         props = {k: v for k, v in props.items() if k in requested}
         if os.environ.get("BULK_NULLS"):  # as search does: every requested property, set or not
-            props = {name: props.get(name) for name in requested if name in known}
+            props = {name: props.get(name) for name in requested if name in self.known[obj]}
         return {"id": str(rid), "properties": props, "createdAt": "2024-01-01T00:00:00.000Z",
                 "updatedAt": CHANGED_AT, "archived": False}
 

@@ -473,9 +473,12 @@ class Taphubspot(Tap):
     def sync_all(self) -> None:
         """Sync every stream; then log what the run did (tap_hubspot_beta.stats)."""
         sync_stats.reset()
+        from tap_hubspot_beta import allocator
         from tap_hubspot_beta.memdiag import DIAG
 
         DIAG.configure(self.config)
+        # Before any thread pool: two arenas, a fixed mmap threshold (tap_hubspot_beta.allocator).
+        allocator.tune()
         try:
             super().sync_all()
         finally:
