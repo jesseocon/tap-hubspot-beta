@@ -25,6 +25,7 @@ from pendulum import parse
 
 from tap_hubspot_beta.auth import OAuth2Authenticator
 from tap_hubspot_beta import concurrency, rate_limit
+from tap_hubspot_beta.memdiag import DIAG
 from tap_hubspot_beta import stats as sync_stats
 from tap_hubspot_beta.privacy import describe_context, redact_text
 import singer
@@ -67,6 +68,15 @@ def parse_hubspot_datetime(value):
             except ValueError:
                 pass
     return parse(value)
+
+
+def _goes_to_pendulum(value) -> bool:
+    """Whether parse_hubspot_datetime hands this value to pendulum.parse (memory diagnostics)."""
+    if not isinstance(value, str):
+        return True
+    if len(value) >= 11 and value.isdigit():
+        return False
+    return _HUBSPOT_ISO.match(value) is None
 
 
 class TapHubspotDailyAPIQuotaExceededException(Exception):
@@ -294,6 +304,8 @@ class hubspotStream(RESTStream):
             started = time.monotonic()
             response = self.requests_session.send(prepared_request, timeout=self.timeout)
             counter.request(self.name, key, time.monotonic() - started, response.status_code, waited)
+            if DIAG.enabled and response.status_code == 200:
+                DIAG.capture_body(self.name, response.content)
             if response.status_code != 429:
                 limiter.observe(response.headers)
                 return response
@@ -1075,6 +1087,9 @@ class hubspotStream(RESTStream):
     def _write_record_message(self, record: dict) -> None:
         super()._write_record_message(record)
         sync_stats.get().records(self.name, 1)
+        if DIAG.due():
+            stats = sync_stats.get()
+            DIAG.report(self, {n: s.records for n, s in list(stats.streams.items()) if s.records}, self.logger)
 
     def _write_record_count_log(self, record_count: int, context: Optional[dict]) -> None:
         super()._write_record_count_log(record_count=record_count, context=describe_context(context))
@@ -1132,9 +1147,14 @@ class hubspotStream(RESTStream):
                 if row.get(field) in [0, ""]:
                     row[field] = None
                 else:
+                    to_pendulum = DIAG.enabled and _goes_to_pendulum(row[field])
                     try:
                         row[field] = parse_hubspot_datetime(row[field])
+                        if to_pendulum:
+                            DIAG.pendulum(field, failed=False)
                     except Exception:
+                        if to_pendulum:
+                            DIAG.pendulum(field, failed=True)
                         try:
                             dt_field = datetime.fromtimestamp(int(row[field]) / 1000, tz=pytz.UTC)
                             row[field] = dt_field.replace(tzinfo=None)
@@ -1152,6 +1172,8 @@ class hubspotStream(RESTStream):
 
     def post_process(self, row: dict, context: Optional[dict], skip_id=None) -> dict:
         """As needed, append or transform raw data to match expected structure."""
+        if DIAG.enabled:
+            DIAG.capture_raw(self.name, row)
         row = self.parse_properties(row, skip_id=skip_id)
         row = self.parse_datetimes(row)
         row = self.process_row_types(row)

@@ -449,6 +449,16 @@ class Taphubspot(Tap):
             ),
         ),
         th.Property(
+            "memory_diagnostics",
+            th.BooleanType,
+            default=False,
+            description=(
+                "Every 30 s, log MEMDIAG: RSS, glibc heap in use and free, records per stream, "
+                "datetime properties sent to pendulum (and failed), and each per-record step's "
+                "bytes kept per call on the stream's last real record (tap_hubspot_beta.memdiag)."
+            ),
+        ),
+        th.Property(
             "omit_null_properties",
             th.BooleanType,
             default=False,
@@ -463,6 +473,9 @@ class Taphubspot(Tap):
     def sync_all(self) -> None:
         """Sync every stream; then log what the run did (tap_hubspot_beta.stats)."""
         sync_stats.reset()
+        from tap_hubspot_beta.memdiag import DIAG
+
+        DIAG.configure(self.config)
         try:
             super().sync_all()
         finally:

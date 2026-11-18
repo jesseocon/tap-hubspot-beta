@@ -9,6 +9,7 @@ import requests
 from hotglue_singer_sdk.helpers.jsonpath import extract_jsonpath
 
 from tap_hubspot_beta import concurrency
+from tap_hubspot_beta.memdiag import DIAG
 from tap_hubspot_beta.client_base import ChildPipeline, hubspotStream
 from pendulum import parse
 from datetime import datetime, timedelta, timezone
@@ -717,6 +718,8 @@ class hubspotV3SearchStream(hubspotStream):
 
     def post_process(self, row: dict, context: Optional[dict]) -> dict:
         """As needed, append or transform raw data to match expected structure."""
+        if DIAG.enabled:
+            DIAG.capture_raw(self.name, row)
         if self.properties_url and isinstance(row.get("properties"), dict):
             if self.omit_null_properties:
                 # Unset properties are left out on every path (search sends them as null).
