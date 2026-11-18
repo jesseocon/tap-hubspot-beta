@@ -144,7 +144,8 @@ def sync(obj: str, count: int, props: int, workdir: Path) -> None:
     from tap_hubspot_beta.tap import Taphubspot
 
     fake = BulkHubSpot({obj: count}, props)
-    config = {"sync_strategy": "list", "max_parallel_requests": 8, "omit_null_properties": True}
+    config = {"sync_strategy": "list", "max_parallel_requests": 8, "omit_null_properties": True,
+              **({"memory_diagnostics": True} if os.environ.get("BULK_DIAG") else {})}
     # For the whole process, never undone: a batch read still in flight on the pool after a
     # failure must not reach HubSpot.
     requests.Session.send = lambda s, r, **k: fake.send(s, r, **k)
