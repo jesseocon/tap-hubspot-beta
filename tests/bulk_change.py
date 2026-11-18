@@ -51,6 +51,11 @@ class BulkHubSpot(FakeHubSpot):
             self.names[obj] = base + [f"p{i:04d}_{obj}" for i in range(props - len(base))]
             fake_hubspot.PROPERTIES[obj] = self.names[obj]
         self.known = {obj: set(names) for obj, names in self.names.items()}
+        # BULK_DATETIMES=N: the first N properties are datetimes; HubSpot sends many of them as
+        # epoch milliseconds ("1700000000000"), not ISO text (FourthRev's deals: 212 datetimes).
+        self.datetimes = int(os.environ.get("BULK_DATETIMES") or 0)
+        for obj, names in self.names.items():
+            fake_hubspot.DATETIME_PROPS.update(names[3:3 + self.datetimes])
 
     def send(self, session, request: requests.PreparedRequest, **_: Any) -> requests.Response:
         # As FakeHubSpot.send, without keeping every call.
@@ -90,8 +95,20 @@ class BulkHubSpot(FakeHubSpot):
         modified = fake_hubspot.MODIFIED[obj]
         # Only the object's properties: the request also names record fields (updatedAt, ...),
         # which HubSpot never returns as properties.
-        known = self.known[obj]
-        props = {name: FILL for i, name in enumerate(requested) if (rid + i) % 6 == 0 and name in known}
+        # Text properties only: a datetime's value is a date (HubSpot never sends it text).
+        known = self.known[obj] - fake_hubspot.DATETIME_PROPS
+        if os.environ.get("BULK_REAL"):
+            # Real values: lengths vary per record and property (most short, a few long texts).
+            def value(i):
+                h = (rid * 2654435761 + i * 40503) & 0xFFFFFFFF
+                n = 3 + h % 40 if h % 50 else 200 + h % 3000
+                return (f"{rid}-{i}-" + "v" * n)[:n]
+            props = {name: value(i) for i, name in enumerate(requested) if (rid + i) % 6 == 0 and name in known}
+        else:
+            props = {name: FILL for i, name in enumerate(requested) if (rid + i) % 6 == 0 and name in known}
+        for i, name in enumerate(self.names[obj][3:3 + self.datetimes]):
+            if name in requested and (rid + i) % 2 == 0:
+                props[name] = str(1600000000000 + rid * 1000 + i)
         props.update({modified: CHANGED_AT, "createdate": "2024-01-01T00:00:00.000Z", "hs_object_id": str(rid)})
         props = {k: v for k, v in props.items() if k in requested}
         if os.environ.get("BULK_NULLS"):  # as search does: every requested property, set or not
@@ -111,7 +128,13 @@ class BulkHubSpot(FakeHubSpot):
 
 
 def rss_mb(pid: int) -> float:
-    """Resident memory of a process, MB (ps works on macOS and Linux)."""
+    """Resident memory of a process, MB (/proc on Linux, else ps)."""
+    status = Path(f"/proc/{pid}/status")
+    if status.exists():
+        for line in status.read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024
+        return 0.0
     out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return int(out) / 1024 if out else 0.0
 

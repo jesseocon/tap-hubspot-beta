@@ -45,7 +45,18 @@ _HUBSPOT_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\
 
 
 def parse_hubspot_datetime(value):
-    """pendulum.parse(value), faster for HubSpot's usual UTC text (an equal, UTC datetime)."""
+    """pendulum.parse(value), faster for HubSpot's usual UTC text (an equal, UTC datetime).
+
+    Epoch milliseconds ("1700000000123", how HubSpot sends many datetime properties set through
+    its API) are read here and never reach pendulum.parse: pendulum 2.1.2's C parser
+    (pendulum.parsing._iso8601) leaks ~115 bytes on every string it can't parse, and
+    parse_datetimes only got to its epoch fallback after that failure. FourthRev's deals (212
+    datetime properties, ~100 of them epoch values a record) grew a tap process by ~20 KB a
+    record: 2.35 GB at 97,000 deals, killed (-9) at 4 GiB on 2026-11-18. The value is the
+    fallback's (fromtimestamp of ms / 1000), in UTC."""
+    # 11+ digits: shorter ones can be ISO basic dates (20240101), which pendulum reads.
+    if isinstance(value, str) and len(value) >= 11 and value.isdigit():
+        return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
     if isinstance(value, str):
         match = _HUBSPOT_ISO.match(value)
         if match:
