@@ -8,7 +8,7 @@ import math
 import requests
 from hotglue_singer_sdk.helpers.jsonpath import extract_jsonpath
 
-from tap_hubspot_beta import concurrency
+from tap_hubspot_beta import allocator, concurrency
 from tap_hubspot_beta.memdiag import DIAG
 from tap_hubspot_beta.client_base import ChildPipeline, hubspotStream
 from pendulum import parse
@@ -22,6 +22,18 @@ from hotglue_singer_sdk.helpers._state import (
     finalize_state_progress_markers,
     log_sort_error
 )
+
+# List pages between malloc_trim calls (tap_hubspot_beta.allocator): ~5,000 records.
+TRIM_EVERY_PAGES = 50
+
+
+def _without_nulls(record: dict) -> dict:
+    """A batch-read record with only its set properties."""
+    props = record.get("properties")
+    if isinstance(props, dict):
+        record = dict(record)
+        record["properties"] = {k: v for k, v in props.items() if v is not None}
+    return record
 
 
 class hubspotV3SearchStream(hubspotStream):
@@ -589,7 +601,9 @@ class hubspotV3SearchStream(hubspotStream):
                 after = next_after
 
         depth = concurrency.max_parallel(self.config) if batch_read else concurrency.PREFETCH_PAGES
-        for future in concurrency.prefetch(pages, depth=depth, enabled=pool is not None):
+        for n, future in enumerate(concurrency.prefetch(pages, depth=depth, enabled=pool is not None), 1):
+            if n % TRIM_EVERY_PAGES == 0:
+                allocator.trim()
             rows = [self._shape_like_search(r, requested) for r in future.result()]
             for row in self.get_associations_data(rows):
                 yield row
@@ -604,7 +618,14 @@ class hubspotV3SearchStream(hubspotStream):
             json={"properties": requested, "inputs": [{"id": str(i)} for i in ids]},
         )
         response = decorated_request(prepared, context)
-        by_id = {str(r.get("id")): r for r in response.json().get("results", [])}
+        results = response.json().get("results", [])
+        del response  # its ~8 MB body (100 wide records) goes now, on this thread
+        if self.omit_null_properties:
+            # Compact here, on the worker that decoded the page: the wide decoded records are
+            # freed by the thread (and arena) that made them, and the page waiting in the
+            # read-ahead holds only set properties (~16% of a wide object's).
+            results = [_without_nulls(r) for r in results]
+        by_id = {str(r.get("id")): r for r in results}
         return [by_id[str(i)] for i in ids if str(i) in by_id]
 
     # Search pages are read ahead of the records being written: the buckets and cursor live on

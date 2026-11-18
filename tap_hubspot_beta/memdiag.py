@@ -103,7 +103,6 @@ class MemDiag:
         return self.enabled and time.monotonic() >= self.next_at
 
     def report(self, stream_obj: Any, records: Dict[str, int], logger: Any) -> None:
-        self.next_at = time.monotonic() + DIAG_SECONDS
         name = stream_obj.name
         out: Dict[str, Any] = {"stream": name, "rss_mb": round((rss() or 0) / MB)}
         h = heap()
@@ -116,6 +115,8 @@ class MemDiag:
         out["probes"] = self.probes(stream_obj)
         self.want_raw.add(name)
         logger.info("MEMDIAG %s", json.dumps(out, separators=(",", ":"), default=str))
+        # From the end of the probes: on a slow machine they can take longer than the interval.
+        self.next_at = time.monotonic() + DIAG_SECONDS
 
     def probes(self, s: Any) -> Dict[str, Any]:
         """Bytes per call still in use after each step, on this stream's last real data."""
