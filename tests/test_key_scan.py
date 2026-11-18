@@ -71,6 +71,29 @@ def test_no_scan_until_due_and_none_without_the_setting(tmp_path):
     assert "_sdc_key_only" not in schema(messages, "contacts")["properties"]
 
 
+@pytest.mark.parametrize("hours_ago, scans", [(19.5, False), (20.5, True), (23.9, True)])
+def test_a_scan_comes_due_a_sixth_of_the_interval_early(tmp_path, hours_ago, scans):
+    """A scheduled run a few minutes short of a day since the last scan still scans (FourthRev,
+    2026-11-17: the 17:00 run came 22h56m after an 18:04 scan and put it off to 23:00, 29 hours)."""
+    fake = FakeHubSpot(SIZES)
+    last = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+    messages = run_tap(fake, tmp_path, streams=["contacts"], state=bookmark("contacts", key_scan_at=last),
+                       key_scan_interval_hours=24)
+    assert bool(key_rows(messages, "contacts")) is scans
+    assert (scanned_at(messages, "contacts") != last) is scans
+
+
+def test_a_run_that_does_not_scan_says_when_the_next_one_is_due(tmp_path, caplog):
+    fake = FakeHubSpot(SIZES)
+    last = datetime.now(timezone.utc) - timedelta(hours=1)
+    with caplog.at_level("INFO"):
+        run_tap(fake, tmp_path, streams=["contacts"], state=bookmark("contacts", key_scan_at=last.isoformat()),
+                key_scan_interval_hours=24)
+    due = (last + timedelta(hours=20)).isoformat()
+    assert any(f"contacts: key scan not due (last {last.isoformat()}; next on the first run after {due})" in r.getMessage()
+               for r in caplog.records)
+
+
 def test_key_scan_forces_one(tmp_path):
     fake = FakeHubSpot(SIZES)
     recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
