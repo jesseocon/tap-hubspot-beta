@@ -625,6 +625,13 @@ class hubspotV3SearchStream(hubspotStream):
 
     KEY_ONLY_COLUMN = "_sdc_key_only"
     KEY_SCAN_BOOKMARK = "key_scan_at"
+    # A scan comes due a sixth of the interval early (20 hours of 24): a schedule's runs start
+    # minutes apart from one day to the next, and a run a little short of the full interval
+    # would otherwise put the scan off a whole cycle. FourthRev, 2026-11-17: runs every 6 hours,
+    # last scan 18:04, the 17:00 run (22h56m later) skipped it and the next was due at 23:00, 29
+    # hours after the last. With the slack a 6-hourly schedule scans every 4th run, a daily one
+    # every run, an hourly one about every 20 hours.
+    KEY_SCAN_EARLY = 1 / 6
 
     def key_scans_on(self) -> bool:
         configured = self.config.get("key_scan") in (True, "true") or bool(self.config.get("key_scan_interval_hours"))
@@ -635,16 +642,20 @@ class hubspotV3SearchStream(hubspotStream):
             return False
         if self.config.get("key_scan") in (True, "true"):
             return True
+        due_after = self.key_scan_due_after()
+        return due_after is not None and now >= due_after
+
+    def key_scan_due_after(self) -> Optional[datetime]:
+        """When the next scan is due by the interval: the earliest possible time when none was
+        recorded (or it can't be read), None when scans are off."""
         hours = float(self.config.get("key_scan_interval_hours") or 0)
         if hours <= 0:
-            return False
+            return None
         last = self.stream_state.get(self.KEY_SCAN_BOOKMARK)
-        if not last:
-            return True
         try:
-            return now - parse(last) >= timedelta(hours=hours)
+            return parse(last) + timedelta(hours=hours * (1 - self.KEY_SCAN_EARLY))
         except Exception:
-            return True
+            return datetime.min.replace(tzinfo=timezone.utc)
 
     def _generate_schema_messages(self):
         """The stream's SCHEMA, with _sdc_key_only when it scans keys."""
@@ -737,6 +748,7 @@ class hubspotV3SearchStream(hubspotStream):
         started = datetime.now(timezone.utc)
         key_scan = selected and not context and self._has_bookmark(None) and self.key_scan_due(started)
         listed_all = selected and not context and not self._has_bookmark(None) and self.key_scans_on()
+        not_due = selected and not context and not key_scan and not listed_all and self.key_scans_on()
         # Child batches are read on the worker pool and written in order (ChildPipeline).
         children = ChildPipeline(self, fallback=self._sync_child)
 
@@ -831,6 +843,13 @@ class hubspotV3SearchStream(hubspotStream):
             finalize_state_progress_markers(self.stream_state)
         if key_scan:
             self._key_scan(started)
+        elif not_due:
+            self.logger.info(
+                "%s: key scan not due (last %s; next on the first run after %s)",
+                self.name,
+                self.stream_state.get(self.KEY_SCAN_BOOKMARK),
+                self.key_scan_due_after().isoformat(),
+            )
         elif listed_all:
             self.stream_state[self.KEY_SCAN_BOOKMARK] = started.isoformat()
         self._write_record_count_log(record_count=record_count, context=context)
